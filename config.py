@@ -5,21 +5,36 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Bot configuration
-BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-ADMIN_IDS = [int(id_str.strip()) for id_str in os.getenv('ADMIN_IDS', '').split(',') if id_str.strip().isdigit()]
+BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN') or os.getenv('BOT_TOKEN')
+if not BOT_TOKEN:
+    raise ValueError("TELEGRAM_BOT_TOKEN or BOT_TOKEN environment variable is not set")
 
-# Supabase configuration
-SUPABASE_URL = os.getenv('SUPABASE_URL')
-SUPABASE_KEY = os.getenv('SUPABASE_KEY')
+ADMIN_IDS = [int(id_str.strip()) for id_str in os.getenv('ADMIN_IDS', '').split(',') if id_str.strip().isdigit()]
+if not ADMIN_IDS:
+    print("Warning: No ADMIN_IDS set. Admin features will not work.")
+
+# MongoDB configuration
+MONGODB_URI = os.getenv('MONGODB_URI')
+if not MONGODB_URI:
+    raise ValueError("MONGODB_URI environment variable is not set")
+
+DATABASE_NAME = 'confession_bot'
 
 # Bot settings
 MAX_BIO_LENGTH = 500
 MAX_CONFESSION_LENGTH = 2000
 MAX_COMMENT_LENGTH = 1000
 
-# Channel/Group IDs (if needed)
-CHANNEL_ID = os.getenv('CHANNEL_ID')  # Add this to .env when you have a channel
-ADMIN_GROUP_ID = os.getenv('ADMIN_GROUP_ID')  # Add this to .env for admin group
+# Channel/Group IDs
+try:
+    CHANNEL_ID = int(os.getenv('CHANNEL_ID', '0'))
+    ADMIN_GROUP_ID = int(os.getenv('ADMIN_GROUP_ID', '0'))
+    if not CHANNEL_ID or not ADMIN_GROUP_ID:
+        print("Warning: CHANNEL_ID or ADMIN_GROUP_ID is not properly set")
+except (ValueError, TypeError) as e:
+    print(f"Error parsing CHANNEL_ID or ADMIN_GROUP_ID: {e}")
+    CHANNEL_ID = 0
+    ADMIN_GROUP_ID = 0
 
 # Messages
 MESSAGES = {

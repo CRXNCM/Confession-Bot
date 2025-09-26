@@ -1,5 +1,5 @@
-from supabase import create_client, Client
-from config import SUPABASE_URL, SUPABASE_KEY
+from pymongo import MongoClient
+from config import MONGODB_URI, DATABASE_NAME
 from typing import Dict, List, Optional, Any
 import logging
 
@@ -15,92 +15,126 @@ class Database:
         return cls._instance
     
     def _initialize(self):
-        """Initialize the Supabase client."""
+        """Initialize the MongoDB client."""
         try:
-            self.supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-            logger.info("Successfully connected to Supabase")
+            self.client = MongoClient(MONGODB_URI)
+            self.db = self.client[DATABASE_NAME]  # Use the configured database name
+            logger.info("Successfully connected to MongoDB")
         except Exception as e:
-            logger.error(f"Error connecting to Supabase: {e}")
+            logger.error(f"Error connecting to MongoDB: {e}")
             raise
     
-    # User related methods
+    def get_collection(self, collection_name: str):
+        """Get a reference to a MongoDB collection."""
+        return self.db[collection_name]
+    
     async def get_user(self, user_id: int) -> Optional[Dict]:
         """Get user by Telegram user ID."""
         try:
-            response = self.supabase.table('users').select('*').eq('user_id', user_id).execute()
-            return response.data[0] if response.data else None
+            collection = self.get_collection('users')
+            return collection.find_one({'user_id': user_id})
         except Exception as e:
             logger.error(f"Error getting user {user_id}: {e}")
-            return None
+            raise
     
     async def create_user(self, user_data: Dict) -> Optional[Dict]:
         """Create a new user."""
         try:
-            response = self.supabase.table('users').insert(user_data).execute()
-            return response.data[0] if response.data else None
+            collection = self.get_collection('users')
+            result = collection.insert_one(user_data)
+            return collection.find_one({"_id": result.inserted_id})
         except Exception as e:
             logger.error(f"Error creating user: {e}")
-            return None
+            raise
     
     async def update_user_bio(self, user_id: int, bio: str) -> bool:
         """Update user's bio."""
         try:
-            self.supabase.table('users').update({'bio': bio}).eq('user_id', user_id).execute()
-            return True
+            collection = self.get_collection('users')
+            result = collection.update_one(
+                {'user_id': user_id}, 
+                {"$set": {'bio': bio}},
+                upsert=True
+            )
+            return result.modified_count > 0 or result.upserted_id is not None
         except Exception as e:
             logger.error(f"Error updating bio for user {user_id}: {e}")
-            return False
+            raise
     
     # Confession related methods
     async def create_confession(self, confession_data: Dict) -> Optional[Dict]:
         """Create a new confession."""
         try:
-            response = self.supabase.table('confessions').insert(confession_data).execute()
-            return response.data[0] if response.data else None
+            collection = self.get_collection('confessions')
+            result = collection.insert_one(confession_data)
+            return collection.find_one({"_id": result.inserted_id})
         except Exception as e:
             logger.error(f"Error creating confession: {e}")
-            return None
+            raise
     
     async def get_pending_confessions(self) -> List[Dict]:
         """Get all pending confessions."""
         try:
-            response = self.supabase.table('confessions').select('*').eq('status', 'pending').execute()
-            return response.data
+            collection = self.get_collection('confessions')
+            return list(collection.find({'status': 'pending'}))
         except Exception as e:
             logger.error(f"Error getting pending confessions: {e}")
-            return []
+            raise
     
-    async def update_confession_status(self, confession_id: int, status: str, channel_msg_id: int = None) -> bool:
+    async def update_confession_status(self, confession_id: str, status: str, channel_msg_id: int = None) -> bool:
         """Update confession status and optionally set channel message ID."""
         try:
+            collection = self.get_collection('confessions')
             update_data = {'status': status}
             if channel_msg_id is not None:
                 update_data['channel_msg_id'] = channel_msg_id
-                
-            self.supabase.table('confessions').update(update_data).eq('id', confession_id).execute()
-            return True
+            
+            from bson.objectid import ObjectId
+            result = collection.update_one(
+                {'_id': ObjectId(confession_id)},
+                {'$set': update_data}
+            )
+            return result.modified_count > 0
         except Exception as e:
             logger.error(f"Error updating confession {confession_id}: {e}")
-            return False
     
     # Comment related methods
     async def add_comment(self, comment_data: Dict) -> Optional[Dict]:
         """Add a comment to a confession."""
         try:
-            response = self.supabase.table('comments').insert(comment_data).execute()
-            return response.data[0] if response.data else None
+            collection = self.get_collection('comments')
+            result = collection.insert_one(comment_data)
+            return collection.find_one({"_id": result.inserted_id})
         except Exception as e:
             logger.error(f"Error adding comment: {e}")
-            return None
+            raise
     
-    async def get_comments(self, confession_id: int) -> List[Dict]:
+    async def get_comments(self, confession_id: str) -> List[Dict]:
         """Get all comments for a confession."""
         try:
-            response = self.supabase.table('comments').select('*').eq('confession_id', confession_id).execute()
-            return response.data
+            collection = self.get_collection('comments')
+            from bson.objectid import ObjectId
+            return list(collection.find({'confession_id': ObjectId(confession_id)}).sort('created_at', 1))
         except Exception as e:
             logger.error(f"Error getting comments for confession {confession_id}: {e}")
-            return []
+            raise
+    
+    # Admin methods
+    async def get_stats(self) -> Dict[str, int]:
+        """Get statistics about confessions."""
+        try:
+            collection = self.get_collection('confessions')
+            total = await collection.count_documents({})
+            pending = await collection.count_documents({'status': 'pending'})
+            
+            return {
+                'total': total,
+                'pending': pending,
+                'approved': total - pending
+            }
+        except Exception as e:
+            logger.error(f"Error getting stats: {e}")
+            raise
 
 # Singleton instance
 db = Database()

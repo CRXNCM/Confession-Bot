@@ -2,6 +2,7 @@ import os
 import logging
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from config import ADMIN_GROUP_ID, CHANNEL_ID
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -16,6 +17,7 @@ from typing import Dict, Tuple, Optional, List
 
 # Import models
 from models import User, Confession, Comment, init_db
+from confession import handle_confession, button_callback
 
 # Load environment variables
 load_dotenv()
@@ -149,23 +151,86 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     text = update.message.text.lower()
     user = update.effective_user
     
-    if '📝 confess' in text or 'confess' in text:
-        # Check if user has set a bio first
-        user_data = User.get_user(user.id)
-        if not user_data or 'bio' not in user_data:
-            await update.message.reply_text(
-                "Please set up your bio first using the '👤 Bio' button.",
-                reply_markup=ReplyKeyboardMarkup([['👤 Bio', '❓ Help']], resize_keyboard=True)
+    # Check if user is in the middle of making a confession
+    if context.user_data.get('awaiting_confession'):
+        # Process the confession text
+        confession_text = update.message.text
+        
+        # Save confession to database
+        from database import db
+        confession = {
+            "user_id": user.id,
+            "username": user.username or "Anonymous",
+            "text": confession_text,  # Changed from 'confession' to 'text' to match schema
+            "status": "pending",
+            "created_at": update.message.date,
+            "updated_at": update.message.date
+        }
+        
+        # Use the existing database instance (synchronous operation)
+        collection = db.get_collection('confessions')
+        result = collection.insert_one(confession)
+        confession_id = str(result.inserted_id)
+
+        # Create approval buttons for admin
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Approve", callback_data=f"approve_{confession_id}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"reject_{confession_id}"),
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        # Send to admin group for approval
+        from telegram.helpers import escape_markdown
+        
+        # Escape special characters in the confession text
+        escaped_confession = escape_markdown(confession_text, version=2)
+        
+        # Get user mention or 'Anonymous'
+        user_mention = f"@{user.username}" if user.username else 'Anonymous'
+        
+        admin_message = (
+            f"📨 *New Confession* \(ID: `{confession_id}`\)\n\n"
+            f"👤 *User:* {escape_markdown(user_mention, version=2)}\n"
+            f"🆔 *User ID:* `{user.id}`\n\n"
+            f"💬 *Confession:*\n{escaped_confession}"
+        )
+
+        await context.bot.send_message(
+            chat_id=ADMIN_GROUP_ID,
+            text=admin_message,
+            reply_markup=reply_markup,
+            parse_mode="MarkdownV2"
+        )
+
+        # Reset the state
+        context.user_data['awaiting_confession'] = False
+        
+        # Confirm to user
+        await update.message.reply_text(
+            "✅ Your confession has been received and is pending approval by admins. "
+            "It will be posted to the channel soon if approved.",
+            reply_markup=ReplyKeyboardMarkup(
+                [['📝 Confess', '👤 Bio'], ['❓ Help']],
+                resize_keyboard=True
             )
-            return
-            
-        # Store that user is in confession mode
+        )
+        return
+    
+    # Handle main menu buttons
+    if '📝 confess' in text or 'confess' in text:
+        # Set state to await confession
         context.user_data['awaiting_confession'] = True
         await update.message.reply_text(
-            "✍️ Please type your confession (max 2000 characters):",
-            reply_markup=ReplyKeyboardMarkup([['❌ Cancel']], resize_keyboard=True)
+            "✍️ Please type your confession. It will be reviewed by admins before posting.",
+            reply_markup=ReplyKeyboardMarkup(
+                [['❌ Cancel']],
+                resize_keyboard=True
+            )
         )
-        
+        return
+            
     elif '👤 bio' in text or 'bio' in text:
         # Check if user already has a bio
         user_data = User.get_user(user.id)
@@ -192,29 +257,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data.pop('awaiting_confession', None)
         context.user_data.pop('awaiting_bio', None)
         await show_main_menu(update, context)
-        
-    elif context.user_data.get('awaiting_confession'):
-        # Handle confession submission
-        if len(text) > 2000:
-            await update.message.reply_text("❌ Your confession is too long. Please keep it under 2000 characters.")
-            return
-            
-        # Save confession to database
-        confession = Confession.create_confession({
-            'user_id': user.id,
-            'text': update.message.text,
-            'username': user.username or user.full_name
-        })
-        
-        # Reset state
-        context.user_data.pop('awaiting_confession', None)
-        
-        # Send confirmation
-        await update.message.reply_text(
-            "✅ Your confession has been submitted for review!\n\n"
-            "It will be posted to the channel once approved by an admin.",
-            reply_markup=ReplyKeyboardMarkup([['📝 New Confession', '👤 Bio']], resize_keyboard=True)
-        )
+        return
         
     elif context.user_data.get('awaiting_bio'):
         # Handle bio submission
@@ -261,9 +304,11 @@ def main() -> None:
     # Create the Application
     application = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN')).build()
 
-    # Add command handlers
+    # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("confess", handle_confession))
+    application.add_handler(CallbackQueryHandler(button_callback))
     
     # Add callback query handler for button clicks
     application.add_handler(CallbackQueryHandler(button_click))
