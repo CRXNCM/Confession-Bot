@@ -1,0 +1,13 @@
+# Telegram Bot
+python-telegram-bot==20.7
+
+# MongoDB Driver (sync version)
+pymongo[srv]==4.9.1
+
+# Environment variables
+python-dotenv==1.0.1
+
+# Optional: Async MongoDB driver
+motor==3.5.1
+
+# (no need to pin httpx, it'll be pulled automatically)

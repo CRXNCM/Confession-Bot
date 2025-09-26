@@ -1,0 +1,182 @@
+Project Plan: Telegram Confession Bot
+1. Project Overview
+
+A Telegram bot where:
+
+Users can create a short anonymous bio.
+
+Submit confessions (with admin approval).
+
+Confessions are posted to a Telegram channel with inline 💬 Comment button.
+
+Users can click “Comment” → bot shows the confession + existing comments → user can add their own comment.
+
+Comment count updates on the channel button.
+
+2. Core Features
+🔹 User Features
+
+Create/edit bio.
+
+Submit confession anonymously.
+
+Comment on confessions.
+
+View other comments on confessions.
+
+🔹 Admin Features
+
+Review confessions (approve/reject).
+
+If approved → post to channel with comment button.
+
+🔹 System Features
+
+Store all data in Supabase (Postgres).
+
+Auto-update comment count on channel post.
+
+Secure + scalable with online DB.
+
+3. Tech Stack
+
+Telegram Bot API
+
+Python (python-telegram-bot) (or Node.js with telegraf, but we’ll stick with Python here).
+
+Supabase (Postgres) → free tier.
+
+Hosting: Railway / Render / Heroku / VPS
+
+4. Supabase Database Schema
+-- Users table
+CREATE TABLE users (
+  user_id BIGINT PRIMARY KEY,      -- Telegram user ID
+  bio TEXT NOT NULL
+);
+
+-- Confessions table
+CREATE TABLE confessions (
+  id SERIAL PRIMARY KEY,
+  user_id BIGINT REFERENCES users(user_id),
+  text TEXT NOT NULL,
+  status TEXT DEFAULT 'pending',    -- pending/approved/rejected
+  channel_msg_id BIGINT,            -- to update buttons later
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Comments table
+CREATE TABLE comments (
+  id SERIAL PRIMARY KEY,
+  confession_id INT REFERENCES confessions(id),
+  user_id BIGINT REFERENCES users(user_id),
+  text TEXT NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+5. Bot Workflow
+
+/start
+
+If new user → ask for bio.
+
+Save in users.
+
+Submit Confession
+
+User sends text.
+
+Store in confessions (status = pending).
+
+Forward to admin group with ✅ Approve / ❌ Reject buttons.
+
+Approval Flow
+
+If admin clicks ✅ → post to channel with:
+
+📝 Confession #12 (by AnonymousX)
+Some text...
+
+
+Inline button: 💬 Comment (0)
+
+If ❌ → mark as rejected.
+
+Comment Flow
+
+When someone clicks "💬 Comment" on channel:
+
+Bot opens private chat with them.
+
+Shows confession + all comments.
+
+Lets them send a comment.
+
+Saves in DB → updates button to 💬 Comment (n+1).
+
+Edit Bio (/bio)
+
+User can update their bio.
+
+6. Milestones
+🔹 Phase 1 – Setup (1 day)
+
+Create bot via BotFather.
+
+Create Supabase project + DB schema.
+
+Connect bot to Supabase (supabase-py).
+
+🔹 Phase 2 – User Features (2 days)
+
+Implement /start + bio saving.
+
+Confession submission → stored in DB.
+
+🔹 Phase 3 – Admin Approval (2 days)
+
+Forward confessions to admin group with inline buttons.
+
+Approve → post to channel.
+
+Reject → mark rejected.
+
+🔹 Phase 4 – Comment System (3–4 days)
+
+Add “💬 Comment” button.
+
+Show confession + comments when clicked.
+
+Allow posting new comments.
+
+Update channel button with comment count.
+
+🔹 Phase 5 – Deployment & Testing (2 days)
+
+Deploy bot to Railway/Render.
+
+Test with multiple users.
+
+Debug + polish.
+
+Total: ~7–10 days for MVP
+
+7. Possible Future Upgrades
+
+Anonymous Replies to comments (nested threads).
+
+Like ❤️ button for confessions/comments.
+
+Trending confessions (most comments/likes).
+
+Multi-language support.
+
+Admin dashboard (Supabase + Next.js frontend).
+
+8. Hosting Plan
+
+Railway: Free 500 hrs + 1GB DB/month → good starter.
+
+Render: Free tier with web service.
+
+Supabase: Free tier (perfect for DB).
