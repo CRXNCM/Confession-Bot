@@ -1,20 +1,24 @@
 # Telegram Confession Bot
 
-An anonymous confession bot for Telegram that allows users to submit confessions and comment on them.
+An anonymous confession bot for Telegram that allows users to submit confessions, comment on them, and engage in anonymous discussions.
 
 ## Features
 
-- Anonymous confession submission
-- Admin approval system
-- Commenting on confessions
-- Real-time updates
-- Secure and scalable with Supabase
+- Anonymous confession submission with sequential numbering
+- Admin approval system with moderation
+- Commenting on confessions with like/dislike reactions
+- Real-time updates and notifications
+- Anonymous chat between users with approval flow
+- Secure and scalable with MongoDB
+- Comment count tracking on channel posts
+- User reporting system for inappropriate content
 
 ## Prerequisites
 
 - Python 3.8+
 - Telegram Bot Token from [@BotFather](https://t.me/botfather)
-- Supabase account (free tier)
+- MongoDB database (local or cloud)
+- (Optional) Redis for production session management
 
 ## Setup
 
@@ -31,12 +35,11 @@ An anonymous confession bot for Telegram that allows users to submit confessions
 
 3. Configure environment variables:
    - Copy `.env.example` to `.env`
-   - Fill in your Telegram bot token and Supabase credentials
+   - Fill in your Telegram bot token and MongoDB connection string
 
-4. Set up Supabase:
-   - Create a new project on [Supabase](https://supabase.com/)
-   - Run the SQL from `schema.sql` in the SQL editor
-   - Get your project URL and anon/public key from Project Settings > API
+4. Set up MongoDB:
+   - Create a new database
+   - The bot will automatically create the required collections on first run
 
 5. Run the bot:
    ```bash
@@ -46,8 +49,11 @@ An anonymous confession bot for Telegram that allows users to submit confessions
 ## Project Structure
 
 - `bot.py` - Main application entry point
+- `bot.py` - Main bot logic and handlers
+- `confession.py` - Confession handling and moderation
+- `models.py` - Database models and operations
 - `config.py` - Configuration settings
-- `database.py` - Database operations
+- `database.py` - Database connection setup
 - `.env` - Environment variables (not committed to version control)
 - `requirements.txt` - Python dependencies
 
@@ -56,20 +62,59 @@ An anonymous confession bot for Telegram that allows users to submit confessions
 Create a `.env` file with the following variables:
 
 ```
-# Telegram Bot Token from @BotFather
+# Telegram Bot Configuration
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
 
-# Supabase Configuration
-SUPABASE_URL=your_supabase_url_here
-SUPABASE_KEY=your_supabase_anon_key_here
-
-# Admin User ID (comma-separated for multiple admins)
+# Admin User IDs (comma-separated for multiple admins)
 ADMIN_IDS=123456789,987654321
+
+# Channel ID where confessions will be posted
+CHANNEL_ID=-1001234567890
+
+# Admin Group ID for moderation
+ADMIN_GROUP_ID=-1001234567890
+
+# MongoDB Connection String
+MONGODB_URI=mongodb://username:password@host:port/database_name
 ```
+
+## Key Features in Detail
+
+### Confession Submission
+- Users can submit confessions which are held for admin approval
+- Each approved confession gets a unique sequential number
+- Confessions are posted to the configured channel with comment functionality
+
+### Comment System
+- Users can comment on confessions
+- Comments support rich text formatting
+- Like/Dislike functionality for comments
+- Reply functionality for threaded discussions
+
+### Moderation
+- Admin approval system for all confessions
+- User reporting system for inappropriate content
+- Ability to ban users if needed
+
+### Anonymous Chat
+- Users can request to chat anonymously with confession authors
+- Chat requires approval from the confession author
+- Secure and private messaging between users
 
 ## Database Schema
 
-See `schema.sql` for the database schema.
+The bot uses MongoDB with the following collections:
+- `confessions` - Stores all confessions with their status and metadata
+- `comments` - Stores comments and their relationships to confessions
+- `users` - User information and preferences
+
+## Deployment
+
+For production deployment, consider using:
+- A VPS or cloud provider
+- Process manager like PM2 or systemd
+- Redis for session management (optional)
+- Monitoring and logging
 
 ## Contributing
 
