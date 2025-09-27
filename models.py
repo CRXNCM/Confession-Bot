@@ -53,6 +53,8 @@ def init_db():
         
         # Comments collection indexes
         COMMENTS_COLLECTION.create_index([("confession_id", ASCENDING)])
+        COMMENTS_COLLECTION.create_index([("confession_id", ASCENDING), ("roll_no", ASCENDING)])
+        COMMENTS_COLLECTION.create_index([("parent_comment_id", ASCENDING)])
         COMMENTS_COLLECTION.create_index([("user_id", ASCENDING)])
         COMMENTS_COLLECTION.create_index([("created_at", ASCENDING)])
         
@@ -127,10 +129,48 @@ class Comment:
         """Add a comment to a confession."""
         comment_data["created_at"] = datetime.utcnow()
         comment_data["updated_at"] = datetime.utcnow()
+        comment_data.setdefault("likes", 0)
+        comment_data.setdefault("dislikes", 0)
+        comment_data.setdefault("parent_comment_id", None)
+        # Assign a sequential roll number per confession for top-level comments only
+        if not comment_data.get("parent_comment_id"):
+            last = COMMENTS_COLLECTION.find({"confession_id": comment_data["confession_id"], "parent_comment_id": None})\
+                .sort("roll_no", -1).limit(1)
+            last_roll = 0
+            for doc in last:
+                last_roll = doc.get("roll_no", 0)
+            comment_data["roll_no"] = last_roll + 1
         result = COMMENTS_COLLECTION.insert_one(comment_data)
         return COMMENTS_COLLECTION.find_one({"_id": result.inserted_id})
 
     @staticmethod
     def get_comments(confession_id: str) -> List[Dict]:
         """Get all comments for a confession."""
-        return list(COMMENTS_COLLECTION.find({"confession_id": confession_id}).sort("created_at", 1))
+        # Top-level comments only, ordered by roll number if present, else created_at
+        cursor = COMMENTS_COLLECTION.find({
+            "confession_id": confession_id,
+            "parent_comment_id": None
+        }).sort([("roll_no", 1), ("created_at", 1)])
+        return list(cursor)
+
+    @staticmethod
+    def get_comment(comment_id: Any) -> Optional[Dict]:
+        return COMMENTS_COLLECTION.find_one({"_id": comment_id})
+
+    @staticmethod
+    def like_comment(comment_id: Any) -> None:
+        COMMENTS_COLLECTION.update_one({"_id": comment_id}, {"$inc": {"likes": 1}})
+
+    @staticmethod
+    def dislike_comment(comment_id: Any) -> None:
+        COMMENTS_COLLECTION.update_one({"_id": comment_id}, {"$inc": {"dislikes": 1}})
+
+    @staticmethod
+    def add_reply(parent_comment_id: Any, reply_data: Dict) -> Dict:
+        reply_data["parent_comment_id"] = parent_comment_id
+        reply_data["created_at"] = datetime.utcnow()
+        reply_data["updated_at"] = datetime.utcnow()
+        reply_data.setdefault("likes", 0)
+        reply_data.setdefault("dislikes", 0)
+        result = COMMENTS_COLLECTION.insert_one(reply_data)
+        return COMMENTS_COLLECTION.find_one({"_id": result.inserted_id})

@@ -72,7 +72,7 @@ async def handle_confession(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     
     # Prepare admin message with user details
     admin_message = (
-        f"📨 *New Confession* \(ID: `{confession_id}`\)\n\n"
+        f"📨 *New Confession* \\(ID: `{confession_id}`\\)\n\n"
         f"👤 *User:* {user_display}\n"
         f"🆔 *User ID:* `{user.id}`\n"
         f"🔗 *Profile Link:* [Contact User](tg://user?id={user.id})\n\n"
@@ -197,28 +197,53 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             # Format the message for the channel (no user info)
             from telegram.helpers import escape_markdown
             
+            # Get the total count of approved confessions for the number
+            confessions_col = db.get_collection('confessions')
+            confession_number = confessions_col.count_documents({"status": "approved"}) + 1
+            
             # Escape the confession text for MarkdownV2
             escaped_confession = escape_markdown(confession['text'], version=2)
             
             channel_message = (
-                "💌 *New Confession*\n\n"
+                f"💌 *Confession #{confession_number}*\n\n"
                 f"💬 {escaped_confession}\n\n"
-                "\#Confession"  # Escaped the # with \
+                f"\#Confession{confession_number}"  # Hashtag with confession number
             )
             
             try:
                 print(f"Attempting to send message to channel ID: {CHANNEL_ID}")
+                # Build a deep link back to the bot for comments
+                bot_username = context.bot.username
+                if not bot_username:
+                    me = await context.bot.get_me()
+                    bot_username = me.username
+
+                # Compute existing number of comments for this confession (include replies)
+                comments_col = db.get_collection('comments')
+                comment_count = comments_col.count_documents({'confession_id': confession_id})
+
+                comment_url = f"https://t.me/{bot_username}?start=comment_{confession_id}"
+                channel_keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"💬 Comments ({comment_count})", url=comment_url)]
+                ])
                 # Send to channel
-                await context.bot.send_message(
+                sent = await context.bot.send_message(
                     chat_id=CHANNEL_ID,
                     text=channel_message,
-                    parse_mode="MarkdownV2"
+                    parse_mode="MarkdownV2",
+                    reply_markup=channel_keyboard
                 )
                 print("Message sent to channel successfully")
+                # Store the channel message id on this confession
+                try:
+                    col = db.get_collection('confessions')
+                    col.update_one({"_id": ObjectId(confession_id)}, {"$set": {"channel_msg_id": sent.message_id}})
+                except Exception as e:
+                    print(f"Warning: failed to store channel message id: {e}")
                 
                 # Update the admin message to show it was approved
                 await query.edit_message_text(
-                    f"✅ Confession approved and posted to channel!\n\n"
+                    f"✅ Confession #{confession_number} approved and posted to channel!\n\n"
                     f"Confession ID: `{confession_id}`"
                 )
                 
@@ -228,7 +253,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     if user_id:
                         await context.bot.send_message(
                             chat_id=user_id,
-                            text="🎉 Your confession has been approved and posted to the channel!"
+                            text=f"🎉 Your confession (Confession #{confession_number}) has been approved and posted to the channel!"
                         )
                 except Exception as e:
                     print(f"Could not notify user: {e}")
