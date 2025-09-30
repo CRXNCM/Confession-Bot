@@ -1,6 +1,6 @@
 # Telegram Confession Bot
 
-An anonymous confession bot for Telegram that allows users to submit confessions, comment on them, and engage in anonymous discussions.
+An anonymous confession bot for Telegram that allows users to submit confessions, comment on them, and engage in anonymous discussions with customizable profiles.
 
 ## Features
 
@@ -12,6 +12,11 @@ An anonymous confession bot for Telegram that allows users to submit confessions
 - Secure and scalable with MongoDB
 - Comment count tracking on channel posts
 - User reporting system for inappropriate content
+- **User Profiles** with:
+  - Customizable profile emoji
+  - Personal nickname
+  - Bio section
+  - Confession history
 
 ## Prerequisites
 
@@ -41,7 +46,12 @@ An anonymous confession bot for Telegram that allows users to submit confessions
    - Create a new database
    - The bot will automatically create the required collections on first run
 
-5. Run the bot:
+5. Run the database migration (required for profile features):
+   ```bash
+   python migrate_profile_fields.py
+   ```
+
+6. Run the bot:
    ```bash
    python bot.py
    ```
@@ -54,6 +64,7 @@ An anonymous confession bot for Telegram that allows users to submit confessions
 - `models.py` - Database models and operations
 - `config.py` - Configuration settings
 - `database.py` - Database connection setup
+- `migrate_profile_fields.py` - Database migration script for profile features
 - `.env` - Environment variables (not committed to version control)
 - `requirements.txt` - Python dependencies
 
@@ -95,6 +106,21 @@ MONGODB_URI=mongodb://username:password@host:port/database_name
 - Admin approval system for all confessions
 - User reporting system for inappropriate content
 - Ability to ban users if needed
+
+### User Profiles
+- **Custom Profile Emoji**: Choose from a variety of emojis to represent your profile
+- **Personal Nickname**: Set a custom display name that appears in your profile
+- **Bio Section**: Share a short bio (up to 500 characters) to tell others about yourself
+- **Confession History**: View all your approved confessions in one place
+- **Profile Statistics**: See how many confessions you've submitted
+
+### Profile Customization
+1. Tap on the "👤 Profile" button in the main menu
+2. Choose "⚙️ Customization"
+3. Select what you want to update:
+   - 😀 Change your profile emoji
+   - 📝 Update your nickname
+   - ✏️ Set or update your bio
 
 ### Anonymous Chat
 - Users can request to chat anonymously with confession authors

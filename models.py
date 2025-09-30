@@ -1,107 +1,154 @@
-import os
-import sys
 from datetime import datetime
 from typing import Optional, List, Dict, Any
-from pymongo import MongoClient, ASCENDING
-from pymongo.collection import Collection
-from pymongo.errors import ConnectionFailure, OperationFailure
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
-
-# MongoDB configuration
-MONGODB_URI = os.getenv('MONGODB_URI')
-if not MONGODB_URI:
-    print("Error: MONGODB_URI not found in environment variables")
-    sys.exit(1)
-
-# Add retryWrites and w=majority to the connection string if not present
-if 'retryWrites' not in MONGODB_URI:
-    MONGODB_URI += '&retryWrites=true&w=majority' if '?' in MONGODB_URI else '?retryWrites=true&w=majority'
-
-DB_NAME = "confession_bot"
-
-# Initialize MongoDB client with error handling
-try:
-    # Test the connection
-    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)  # 5 second timeout
-    client.server_info()  # Will raise an exception if connection fails
-    db = client[DB_NAME]
-    print("✅ Successfully connected to MongoDB!")
-except Exception as e:
-    print(f"❌ Failed to connect to MongoDB: {e}")
-    print(f"Connection string: {MONGODB_URI.split('@')[-1] if '@' in MONGODB_URI else MONGODB_URI}")
-    print("Please check your MONGODB_URI in the .env file and ensure your IP is whitelisted in MongoDB Atlas.")
-    sys.exit(1)
+from pymongo import ASCENDING
+from database import db  # Import the Database instance
 
 # Collections
-USERS_COLLECTION = db.users
-CONFESSIONS_COLLECTION = db.confessions
-COMMENTS_COLLECTION = db.comments
-
-def init_db():
-    """Initialize database indexes."""
-    try:
-        # Users collection indexes
-        USERS_COLLECTION.create_index([("user_id", ASCENDING)], unique=True)
-        
-        # Confessions collection indexes
-        CONFESSIONS_COLLECTION.create_index([("user_id", ASCENDING)])
-        CONFESSIONS_COLLECTION.create_index([("status", ASCENDING)])
-        CONFESSIONS_COLLECTION.create_index([("created_at", ASCENDING)])
-        
-        # Comments collection indexes
-        COMMENTS_COLLECTION.create_index([("confession_id", ASCENDING)])
-        COMMENTS_COLLECTION.create_index([("confession_id", ASCENDING), ("roll_no", ASCENDING)])
-        COMMENTS_COLLECTION.create_index([("parent_comment_id", ASCENDING)])
-        COMMENTS_COLLECTION.create_index([("user_id", ASCENDING)])
-        COMMENTS_COLLECTION.create_index([("created_at", ASCENDING)])
-        
-        print("✅ Database indexes created successfully!")
-    except Exception as e:
-        print(f"❌ Error creating database indexes: {e}")
-        # Don't exit here, as the app might still work without indexes
-        pass
+USERS_COLLECTION = db.get_collection('users')
+CONFESSIONS_COLLECTION = db.get_collection('confessions')
+COMMENTS_COLLECTION = db.get_collection('comments')
 
 class User:
     @staticmethod
     def get_user(user_id: int) -> Optional[Dict]:
         """Get user by Telegram user ID."""
-        return USERS_COLLECTION.find_one({"user_id": user_id})
+        user = USERS_COLLECTION.find_one({"user_id": user_id})
+        if not user:
+            return None
+        # Ensure all fields exist
+        user.setdefault('emoji', '👤')  # Default emoji
+        user.setdefault('nickname', None)
+        user.setdefault('bio', None)
+        return user
+
+    @staticmethod
+    def get_or_create_user(user_data: Dict) -> Dict:
+        """Get existing user or create a new one if not exists."""
+        user = USERS_COLLECTION.find_one({"user_id": user_data["user_id"]})
+        if not user:
+            return User.create_user(user_data)
+        return user
 
     @staticmethod
     def create_user(user_data: Dict) -> Dict:
-        """Create a new user."""
-        user_data["created_at"] = datetime.utcnow()
-        user_data["updated_at"] = datetime.utcnow()
+        """Create a new user with default values."""
+        now = datetime.utcnow()
+        user_data.update({
+            "emoji": user_data.get("emoji", "👤"),
+            "nickname": user_data.get("nickname"),
+            "bio": user_data.get("bio"),
+            "created_at": now,
+            "updated_at": now
+        })
         result = USERS_COLLECTION.insert_one(user_data)
         return USERS_COLLECTION.find_one({"_id": result.inserted_id})
 
     @staticmethod
-    def update_user_bio(user_id: int, bio: str) -> bool:
-        """Update user's bio."""
+    def _update_user_field(user_id: int, field: str, value: Any) -> bool:
+        """Generic method to update a user field."""
         result = USERS_COLLECTION.update_one(
             {"user_id": user_id},
             {
                 "$set": {
-                    "bio": bio,
+                    field: value,
                     "updated_at": datetime.utcnow()
+                },
+                "$setOnInsert": {
+                    "created_at": datetime.utcnow()
                 }
-            }
+            },
+            upsert=True
         )
-        return result.modified_count > 0
+        return result.modified_count > 0 or result.upserted_id is not None
+
+    @classmethod
+    def update_user_emoji(cls, user_id: int, emoji: str) -> bool:
+        """Update user's profile emoji."""
+        return cls._update_user_field(user_id, "emoji", emoji)
+
+    @classmethod
+    def update_user_nickname(cls, user_id: int, nickname: str) -> bool:
+        """Update user's nickname."""
+        # Limit nickname length
+        if len(nickname) > 20:
+            nickname = nickname[:20]
+        return cls._update_user_field(user_id, "nickname", nickname)
+
+    @classmethod
+    def update_user_bio(cls, user_id: int, bio: str) -> bool:
+        """Update user's bio."""
+        # Limit bio length
+        if len(bio) > 500:
+            bio = bio[:500]
+        return cls._update_user_field(user_id, "bio", bio)
+    
+    @classmethod
+    def get_user_profile(cls, user_id: int) -> Dict:
+        """Get user's profile information."""
+        user = cls.get_user(user_id)
+        if not user:
+            return {
+                "emoji": "👤",
+                "nickname": "Anonymous",
+                "bio": None,
+                "confession_count": 0
+            }
+        
+        # Get confession count
+        confession_count = CONFESSIONS_COLLECTION.count_documents({
+            "user_id": user_id,
+            "status": "approved"
+        })
+        
+        return {
+            "emoji": user.get("emoji", "👤"),
+            "nickname": user.get("nickname") or "Anonymous",
+            "bio": user.get("bio"),
+            "confession_count": confession_count
+        }
 
 class Confession:
+
+    CATEGORIES = [
+        "General",
+        "Love",
+        "Friendship",
+        "Family",
+        "Work",
+        "School",
+        "Confession",
+        "Advice",
+        "Rant",
+        "Other"
+    ]
+
+    @staticmethod
+    def get_categories() -> List[str]:
+        """Get the list of available categories."""
+        return Confession.CATEGORIES
+
+    @staticmethod
+    def is_valid_category(category: str) -> bool:
+        """Check if a category is valid."""
+        return category in Confession.CATEGORIES
+
     @staticmethod
     def create_confession(confession_data: Dict) -> Dict:
-        """Create a new confession."""
+        """Create a new confession with category validation."""
+        # Set default category if not provided
+        if 'category' not in confession_data or not confession_data['category']:
+            confession_data['category'] = "General"
+        
+        # Validate category
+        if not Confession.is_valid_category(confession_data['category']):
+            confession_data['category'] = "General"  # Default to General if invalid
+            
         confession_data["status"] = "pending"
         confession_data["created_at"] = datetime.utcnow()
         confession_data["updated_at"] = datetime.utcnow()
         result = CONFESSIONS_COLLECTION.insert_one(confession_data)
         return CONFESSIONS_COLLECTION.find_one({"_id": result.inserted_id})
-
+    
     @staticmethod
     def get_pending_confessions() -> List[Dict]:
         """Get all pending confessions."""

@@ -1,6 +1,6 @@
 import os
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ReplyKeyboardMarkup
-from telegram.ext import ContextTypes
+from telegram.ext import ContextTypes, ConversationHandler, CommandHandler, MessageHandler, filters
 from bson.objectid import ObjectId
 from database import db
 from config import ADMIN_GROUP_ID, CHANNEL_ID
@@ -8,108 +8,242 @@ from config import ADMIN_GROUP_ID, CHANNEL_ID
 # Database collection names
 CONFESSIONS_COLLECTION = "confessions"
 
-async def handle_confession(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the /confess command or button press."""
-    # Check if user provided a confession
-    if not context.args:
+# Available categories
+CATEGORIES = [
+    "💖 Love & Relationships",
+    "🎓 School & Education",
+    "👥 Friends & Family",
+    "😕 Confusion & Thoughts",
+    "😔 Regrets",
+    "🎭 Secrets",
+    "🎉 Celebrations",
+    "❓ Other"
+]
+
+# Conversation states
+TEXT, CATEGORY = range(2)
+
+async def handle_confession(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start the confession process."""
+    if context.args:
+        # If confession text is provided directly, ask for category
+        confession_text = " ".join(context.args)
+        context.user_data['confession_text'] = confession_text
+        await ask_for_category(update, context)
+        return CATEGORY
+    else:
+        # If no text provided, ask for it first
         await update.message.reply_text(
-            "Please share your confession after the /confess command.\n"
-            "Example: /confess I have a secret to share..."
+            "✍️ Please type your confession. You'll be able to choose a category next."
         )
-        return
+        return TEXT
 
-    confession_text = " ".join(context.args)
-    user = update.effective_user
-
-    # Save confession to database
-    user = update.effective_user  # Get the user who sent the message
-    user_fullname = ' '.join(filter(None, [user.first_name, user.last_name])) or 'Anonymous'
-    
-    confession = {
-        "user_id": user.id,
-        "username": user.username or "",
-        "first_name": user.first_name or "",
-        "last_name": user.last_name or "",
-        "user_fullname": user_fullname,
-        "text": confession_text,
-        "status": "pending",  # pending, approved, rejected
-        "created_at": update.message.date,
-        "updated_at": update.message.date
-    }
-    
-    # Save confession to database and get the ID
-    result = await db.get_collection(CONFESSIONS_COLLECTION).insert_one(confession)
-    confession_id = str(result.inserted_id)
-    
-    # Create approval buttons for admin
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Approve", callback_data=f"approve_{confession_id}"),
-            InlineKeyboardButton("❌ Reject", callback_data=f"reject_{confession_id}")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    # Send to admin group for approval
-    from telegram.helpers import escape_markdown
-    
-    # Build user display info
-    user_parts = []
-    if user.username:
-        user_parts.append(f"@{escape_markdown(user.username, version=2)}")
-    if user.first_name or user.last_name:
-        name_parts = []
-        if user.first_name:
-            name_parts.append(escape_markdown(user.first_name, version=2))
-        if user.last_name:
-            name_parts.append(escape_markdown(user.last_name, version=2))
-        user_parts.append(' '.join(name_parts))
-    
-    user_display = ' '.join(user_parts) or 'Anonymous'
-    
-    # Escape the confession text
-    escaped_confession = escape_markdown(confession_text, version=2)
-    
-    # Prepare admin message with user details
-    admin_message = (
-        f"📨 *New Confession* \\(ID: `{confession_id}`\\)\n\n"
-        f"👤 *User:* {user_display}\n"
-        f"🆔 *User ID:* `{user.id}`\n"
-        f"🔗 *Profile Link:* [Contact User](tg://user?id={user.id})\n\n"
-        f"💬 *Confession:*\n{escaped_confession}"
-    )
-
+async def receive_confession_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive the confession text and ask for category."""
     try:
-        await context.bot.send_message(
-            chat_id=ADMIN_GROUP_ID,
-            text=admin_message,
-            reply_markup=reply_markup,
-            parse_mode="MarkdownV2"
-        )
+        print("receive_confession_text called")  # Debug log
+        if not update.message or not update.message.text:
+            print("No message or text in update")  # Debug log
+            await update.message.reply_text("❌ Please provide a valid confession text.")
+            return TEXT
+            
+        confession_text = update.message.text
+        print(f"Received confession text: {confession_text}")  # Debug log
+        
+        # Store the confession text in user_data
+        context.user_data['confession_text'] = confession_text
+        print("Stored confession text in user_data")  # Debug log
+        
+        # Ask for category
+        print("Calling ask_for_category")  # Debug log
+        await ask_for_category(update, context)
+        print("Returning CATEGORY state")  # Debug log
+        return CATEGORY
+        
     except Exception as e:
-        print(f"Error sending message to admin group: {e}")
-        # Try sending a simpler message if Markdown parsing fails
-        simple_message = (
-            f"📨 New Confession (ID: {confession_id})\n\n"
-            f"👤 User: {user_display}\n"
-            f"🆔 User ID: {user.id}\n\n"
-            f"💬 Confession:\n{confession_text}"
-        )
-        await context.bot.send_message(
+        print(f"Error in receive_confession_text: {str(e)}")  # Debug log
+        await update.message.reply_text("❌ An error occurred. Please try again.")
+        return ConversationHandler.END
+
+async def ask_for_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show category selection keyboard."""
+    try:
+        print("ask_for_category called")  # Debug log
+        
+        # Create keyboard with categories
+        keyboard = []
+        print(f"Creating keyboard with {len(CATEGORIES)} categories")  # Debug log
+        
+        # Create two buttons per row
+        for i in range(0, len(CATEGORIES), 2):
+            row = []
+            row.append(InlineKeyboardButton(CATEGORIES[i], callback_data=f"category_{i}"))
+            if i + 1 < len(CATEGORIES):
+                row.append(InlineKeyboardButton(CATEGORIES[i+1], callback_data=f"category_{i+1}"))
+            keyboard.append(row)
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        print("Created reply markup")  # Debug log
+        
+        message_text = "📝 Please select a category for your confession:"
+        
+        if update.callback_query:
+            print("Handling callback query")  # Debug log
+            await update.callback_query.answer()
+            try:
+                await update.callback_query.edit_message_text(
+                    message_text,
+                    reply_markup=reply_markup
+                )
+                print("Edited message with category selection")  # Debug log
+            except Exception as e:
+                print(f"Error editing message: {str(e)}")  # Debug log
+                await update.callback_query.message.reply_text(
+                    message_text,
+                    reply_markup=reply_markup
+                )
+        else:
+            print("Sending new message")  # Debug log
+            try:
+                await update.message.reply_text(
+                    message_text,
+                    reply_markup=reply_markup
+                )
+                print("Sent category selection message")  # Debug log
+            except Exception as e:
+                print(f"Error sending message: {str(e)}")  # Debug log
+                raise
+                
+    except Exception as e:
+        print(f"Error in ask_for_category: {str(e)}")  # Debug log
+        error_message = "❌ An error occurred while showing categories. Please try again."
+        if update.callback_query:
+            await update.callback_query.message.reply_text(error_message)
+        elif update.message:
+            await update.message.reply_text(error_message)
+        return ConversationHandler.END
+
+async def save_confession(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Save the confession with the selected category."""
+    try:
+        print("save_confession called")  # Debug log
+        
+        if not update.callback_query:
+            print("No callback query in update")  # Debug log
+            if update.message:
+                await update.message.reply_text("❌ Invalid request. Please use the category buttons to select a category.")
+            return ConversationHandler.END
+            
+        query = update.callback_query
+        await query.answer()
+        
+        print(f"Callback query data: {query.data}")  # Debug log
+        
+        # Get the category index from callback data
+        try:
+            category_idx = int(query.data.split('_')[1])
+            print(f"Category index: {category_idx}")  # Debug log
+            category = CATEGORIES[category_idx]
+            print(f"Selected category: {category}")  # Debug log
+        except (IndexError, ValueError, KeyError) as e:
+            print(f"Error getting category: {str(e)}")  # Debug log
+            await query.edit_message_text("❌ Error: Invalid category selection. Please try again.")
+            return ConversationHandler.END
+        
+        # Get the confession text from user_data
+        confession_text = context.user_data.get('confession_text')
+        print(f"Confession text from user_data: {confession_text}")  # Debug log
+        
+        if not confession_text:
+            error_msg = "❌ Error: Could not find your confession text. Please start over with /confess."
+            print(error_msg)  # Debug log
+            await query.edit_message_text(error_msg)
+            return ConversationHandler.END
+        
+        user = update.effective_user
+        user_fullname = ' '.join(filter(None, [user.first_name, user.last_name])) or 'Anonymous'
+        print(f"User: {user_fullname} (ID: {user.id})")  # Debug log
+        
+        # Prepare confession data
+        confession = {
+            "user_id": user.id,
+            "username": user.username or "",
+            "first_name": user.first_name or "",
+            "last_name": user.last_name or "",
+            "user_fullname": user_fullname,
+            "text": confession_text,
+            "category": category,
+            "status": "pending",  # pending, approved, rejected
+            "created_at": update.effective_message.date,
+            "updated_at": update.effective_message.date
+        }
+        
+        # Add timestamps
+        from datetime import datetime
+        now = datetime.utcnow()
+        confession.update({
+            "created_at": now,
+            "updated_at": now
+        })
+        
+        print(f"Saving confession to database: {confession}")  # Debug log
+        
+        # Save confession to database and get the ID
+        result = await db.get_collection(CONFESSIONS_COLLECTION).insert_one(confession)
+        confession_id = str(result.inserted_id)
+        print(f"Confession saved with ID: {confession_id}")  # Debug log
+        
+        # Clear the user_data to prevent data leakage
+        if 'confession_text' in context.user_data:
+            del context.user_data['confession_text']
+        
+        # Create approval buttons for admin
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Approve", callback_data=f"approve_{confession_id}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"reject_{confession_id}")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Send to admin group for approval
+        admin_message = await context.bot.send_message(
             chat_id=ADMIN_GROUP_ID,
-            text=simple_message,
+            text=f"📨 <b>New Confession (ID: {confession_id})</b>\n\n"
+                 f"👤 <b>From:</b> {user_fullname} (@{user.username or 'N/A'})\n"
+                 f"🏷️ <b>Category:</b> {category}\n\n"
+                 f"📝 <b>Confession:</b>\n{confession_text}",
+            parse_mode='HTML',
             reply_markup=reply_markup
         )
-
-    # Confirm to user
-    await update.message.reply_text(
-        "✅ Your confession has been received and is pending approval by admins. "
-        "It will be posted to the channel soon if approved.",
-        reply_markup=ReplyKeyboardMarkup(
-            [["📝 Confess", "👤 Bio"], ["❓ Help"]],
-            resize_keyboard=True
+        
+        # Update the confession with the admin message ID for future reference
+        await db.get_collection(CONFESSIONS_COLLECTION).update_one(
+            {"_id": result.inserted_id},
+            {"$set": {"admin_message_id": admin_message.message_id}}
         )
-    )
+        
+        print(f"Confirmation sent to admin group. Message ID: {admin_message.message_id}")  # Debug log
+        
+        # Notify user
+        await query.edit_message_text(
+            f"✅ Your confession has been received and is pending approval!\n\n"
+            f"📝 <b>Your Confession:</b>\n{confession_text}\n\n"
+            f"🏷️ <b>Category:</b> {category}\n\n"
+            "Our moderators will review it shortly. Thank you for your patience!",
+            parse_mode='HTML'
+        )
+        
+        return ConversationHandler.END
+        
+    except Exception as e:
+        print(f"Error in save_confession: {str(e)}")  # Debug log
+        error_msg = "❌ An error occurred while saving your confession. Please try again."
+        if update.callback_query:
+            await update.callback_query.message.reply_text(error_msg)
+        elif update.message:
+            await update.message.reply_text(error_msg)
+        return ConversationHandler.END
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle button callbacks for approving/rejecting confessions and other actions."""
@@ -201,13 +335,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             confessions_col = db.get_collection('confessions')
             confession_number = confessions_col.count_documents({"status": "approved"}) + 1
             
-            # Escape the confession text for MarkdownV2
-            escaped_confession = escape_markdown(confession['text'], version=2)
+            # Escape the confession text for HTML
+            from html import escape
+            escaped_confession = escape(confession['text'])
             
+            # Get the category with a default value if not set
+            category = confession.get('category', '❓ Uncategorized')
+            
+            # Create the channel message with HTML formatting
             channel_message = (
-                f"💌 *Confession #{confession_number}*\n\n"
+                f"💌 <b>Confession {confession_number}</b>\n"
+                f"🏷️ <i>{category}</i>\n\n"
                 f"💬 {escaped_confession}\n\n"
-                f"\#Confession{confession_number}"  # Hashtag with confession number
+                f"#Confession{confession_number}"  # No need to escape in HTML mode
             )
             
             try:
@@ -230,7 +370,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 sent = await context.bot.send_message(
                     chat_id=CHANNEL_ID,
                     text=channel_message,
-                    parse_mode="MarkdownV2",
+                    parse_mode="HTML",  # Changed to HTML parsing mode
                     reply_markup=channel_keyboard
                 )
                 print("Message sent to channel successfully")

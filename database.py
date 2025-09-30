@@ -15,14 +15,42 @@ class Database:
         return cls._instance
     
     def _initialize(self):
-        """Initialize the MongoDB client."""
+        """Initialize the MongoDB client and create indexes."""
         try:
             self.client = MongoClient(MONGODB_URI)
             self.db = self.client[DATABASE_NAME]  # Use the configured database name
-            logger.info("Successfully connected to MongoDB")
+            logger.info("✅ Successfully connected to MongoDB!")
+            
+            # Create indexes
+            self._create_indexes()
+            
         except Exception as e:
-            logger.error(f"Error connecting to MongoDB: {e}")
+            logger.error(f"❌ Error connecting to MongoDB: {e}")
             raise
+    
+    def _create_indexes(self):
+        """Create necessary indexes for the database."""
+        try:
+            # Users collection indexes
+            self.db.users.create_index([("user_id", 1)], unique=True)
+            
+            # Confessions collection indexes
+            self.db.confessions.create_index([("user_id", 1)])
+            self.db.confessions.create_index([("status", 1)])
+            self.db.confessions.create_index([("created_at", 1)])
+            
+            # Comments collection indexes
+            self.db.comments.create_index([("confession_id", 1)])
+            self.db.comments.create_index([("confession_id", 1), ("roll_no", 1)])
+            self.db.comments.create_index([("parent_comment_id", 1)])
+            self.db.comments.create_index([("user_id", 1)])
+            self.db.comments.create_index([("created_at", 1)])
+            
+            logger.info("✅ Database indexes created successfully!")
+        except Exception as e:
+            logger.error(f"❌ Error creating database indexes: {e}")
+            # Don't raise here, as the app might still work without indexes
+            pass
     
     def get_collection(self, collection_name: str):
         """Get a reference to a MongoDB collection."""

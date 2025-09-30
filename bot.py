@@ -13,14 +13,35 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters,
     ContextTypes,
-    CallbackContext
+    CallbackContext,
+    ConversationHandler
 )
 from pymongo import MongoClient
 from typing import Dict, Tuple, Optional, List
 
-# Import models
-from models import User, Confession, Comment, init_db
-from confession import handle_confession, button_callback
+# Import models and handlers
+from models import User, Confession, Comment
+from confession import (
+    handle_confession, 
+    button_callback, 
+    receive_confession_text, 
+    save_confession
+)
+
+# Available categories
+CATEGORIES = [
+    "💖 Love & Relationships",
+    "🎓 School & Education",
+    "👥 Friends & Family",
+    "😕 Confusion & Thoughts",
+    "😔 Regrets",
+    "🎭 Secrets",
+    "🎉 Celebrations",
+    "❓ Other"
+]
+
+# Conversation states
+TEXT, CATEGORY = range(2)
 
 # Load environment variables
 load_dotenv()
@@ -41,9 +62,6 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
-# Initialize MongoDB
-init_db()
 
 # Admin IDs (from .env)
 ADMIN_IDS = [int(id_str.strip()) for id_str in os.getenv('ADMIN_IDS', '').split(',') if id_str.strip().isdigit()]
@@ -114,6 +132,57 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle the /start command."""
     t0 = time.perf_counter()
     logger.info(f"/start invoked: { _summarize_update(update) }")
+    
+    # Check if this is a callback query
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        
+        # Handle report callback
+        if query.data.startswith('reportc_'):
+            from bson import ObjectId
+            from models import Comment
+            _, cid = query.data.split('_', 1)
+            try:
+                obj_id = ObjectId(cid)
+            except Exception:
+                await query.message.reply_text("❌ Invalid reference.")
+                return
+                
+            c = Comment.get_comment(obj_id)
+            if not c:
+                await query.message.reply_text("❌ Comment not found.")
+                return
+                
+            reporter = update.effective_user
+            text = c.get('text', '')
+            owner_id = c.get('user_id')
+            admin_msg = (
+                "🚩 Report Received\n\n"
+                f"Comment ID: {cid}\n"
+                f"Owner User ID: {owner_id}\n"
+                f"Reporter User ID: {reporter.id}\n\n"
+                f"Excerpt:\n{text[:500]}"
+            )
+            try:
+                await context.bot.send_message(chat_id=ADMIN_GROUP_ID, text=admin_msg)
+            except Exception as e:
+                logger.warning(f"Failed to send report to admin group: {e}")
+            await query.message.reply_text("✅ Report submitted. Our admins will review this user.")
+            return
+            
+        # Handle request chat callback
+        elif query.data.startswith('requestc_'):
+            from bson import ObjectId
+            from models import Comment
+            _, cid = query.data.split('_', 1)
+            # Rest of the request chat handling code...
+            return
+    
+    # Handle regular /start command with message
+    if not update.message:
+        return
+        
     # Check for deep-link parameters e.g. /start comment_<confession_id>
     if context.args:
         arg = context.args[0]
@@ -132,6 +201,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             logger.info(f"/start deep link (comment) handled in { (time.perf_counter()-t0)*1000:.1f} ms")
             return
+            
         # Handle deep-link to anonymous profile for a specific comment
         if arg.startswith('profilec_'):
             from bson import ObjectId
@@ -142,11 +212,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 await update.message.reply_text("❌ Invalid reference.")
                 return
+                
             c = Comment.get_comment(obj_id)
             if not c:
                 await update.message.reply_text("❌ Comment not found.")
                 return
-            # Optional: show a minimal profile header and actions
+                
+            # Show a minimal profile header and actions
             user_obj = User.get_user(c.get('user_id'))
             bio = (user_obj.get('bio') if user_obj else None) or "This user has not set a bio yet."
             profile_text = (
@@ -160,139 +232,180 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ])
             await update.message.reply_text(profile_text, reply_markup=keyboard)
             return
+            
+        # Handle request chat callback
+        elif query.data.startswith('requestc_'):
+            from bson import ObjectId
+            from models import Comment
+            _, cid = query.data.split('_', 1)
+            
+            try:
+                obj_id = ObjectId(cid)
+            except Exception:
+                await query.answer("❌ Invalid reference.")
+                return
+                
+            c = Comment.get_comment(obj_id)
+            if not c:
+                await query.answer("❌ Comment not found.")
+                return
+                
+            requester_id = update.effective_user.id
+            owner_id = c.get('user_id')
+            
+            if owner_id == requester_id:
+                await query.answer("ℹ️ You cannot request a chat with yourself.")
+                return
+                
+            session_id = str(uuid.uuid4())
+            CHAT_SESSIONS[session_id] = {
+                'requester_id': requester_id,
+                'owner_id': owner_id,
+                'status': 'pending',
+                'comment_id': cid
+            }
+            
+            # Ask owner for approval
+            try:
+                approve_keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("✅ Approve", callback_data=f"approvechat_{session_id}"),
+                        InlineKeyboardButton("❌ Reject", callback_data=f"rejectchat_{session_id}")
+                    ]
+                ])
+                
+                # Get the comment text preview
+                comment_preview = c.get('text', '')[:100]
+                if len(c.get('text', '')) > 100:
+                    comment_preview += "..."
+                
+                await context.bot.send_message(
+                    chat_id=owner_id,
+                    text=(
+                        "💬 *Anonymous Chat Request*\n\n"
+                        f"*Comment Preview:* {comment_preview}\n\n"
+                        "Someone wants to chat with you about this comment.\n"
+                        "Would you like to approve this chat request?"
+                    ),
+                    reply_markup=approve_keyboard,
+                    parse_mode="Markdown"
+                )
+                
+                # Notify requester that the request was sent
+                await query.answer("✅ Chat request sent! You'll be notified if they accept.")
+                
+            except Exception as e:
+                logger.error(f"Error sending chat request: {e}")
+                await query.answer("❌ Failed to send chat request. Please try again later.")
+                
+            return
 
-    # Anonymous profile removed
-
-    # Handle report user: notify admins with context
-    if query.data and query.data.startswith('reportc_'):
-        from bson import ObjectId
-        from models import Comment
-        _, cid = query.data.split('_', 1)
-        try:
-            obj_id = ObjectId(cid)
-        except Exception:
-            await query.message.reply_text("❌ Invalid reference.")
-            return
-        c = Comment.get_comment(obj_id)
-        if not c:
-            await query.message.reply_text("❌ Comment not found.")
-            return
-        reporter = update.effective_user
-        text = c.get('text', '')
-        owner_id = c.get('user_id')
-        admin_msg = (
-            "🚩 Report Received\n\n"
-            f"Comment ID: {cid}\n"
-            f"Owner User ID: {owner_id}\n"
-            f"Reporter User ID: {reporter.id}\n\n"
-            f"Excerpt:\n{text[:500]}"
-        )
-        try:
-            await context.bot.send_message(chat_id=ADMIN_GROUP_ID, text=admin_msg)
-        except Exception:
-            logger.warning("Failed to send report to admin group")
-        await query.message.reply_text("✅ Report submitted. Our admins will review this user.")
-        return
-
-    # Handle request chat: ask owner for approval
-    if query.data and query.data.startswith('requestc_'):
-        from bson import ObjectId
-        from models import Comment
-        _, cid = query.data.split('_', 1)
-        requester_id = update.effective_user.id
-        try:
-            obj_id = ObjectId(cid)
-        except Exception:
-            await query.message.reply_text("❌ Invalid reference.")
-            return
-        c = Comment.get_comment(obj_id)
-        if not c:
-            await query.message.reply_text("❌ Comment not found.")
-            return
-        owner_id = c.get('user_id')
-        if owner_id == requester_id:
-            await query.message.reply_text("ℹ️ You cannot request a chat with yourself.")
-            return
-        session_id = str(uuid.uuid4())
-        CHAT_SESSIONS[session_id] = {
-            'requester_id': requester_id,
-            'owner_id': owner_id,
-            'status': 'pending'
-        }
-        # Ask owner for approval
-        try:
-            approve_keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Approve", callback_data=f"approvechat_{session_id}"),
-                 InlineKeyboardButton("❌ Reject", callback_data=f"rejectchat_{session_id}")]
-            ])
-            await context.bot.send_message(
-                chat_id=owner_id,
-                text=(
-                    "💬 Anonymous Chat Request\n\n"
-                    "Someone wants to chat with you anonymously regarding one of your comments.\n\n"
-                    "Do you approve this request?"
-                ),
-                reply_markup=approve_keyboard
-            )
-        except Exception as e:
-            logger.warning(f"Unable to reach comment owner: {e}")
-            await query.message.reply_text("❌ Could not contact the user. They may not have started the bot.")
-            return
-        await query.message.reply_text("✅ Chat request sent. You'll be notified if they accept.")
-        return
-
-    # Owner responds to chat request
-    if query.data and (query.data.startswith('approvechat_') or query.data.startswith('rejectchat_')):
+    # Handle chat request responses (approve/reject)
+    if update.callback_query and (update.callback_query.data.startswith('approvechat_') or update.callback_query.data.startswith('rejectchat_')):
+        query = update.callback_query
+        await query.answer()
+        
         action, session_id = query.data.split('_', 1)
         sess = CHAT_SESSIONS.get(session_id)
+        
         if not sess or sess.get('status') != 'pending':
             await query.message.reply_text("❌ This chat request is no longer available.")
             return
+            
         owner_id = sess['owner_id']
         requester_id = sess['requester_id']
+        
         if action == 'rejectchat':
-            sess['status'] = 'ended'
+            sess['status'] = 'rejected'
             try:
-                await context.bot.send_message(chat_id=requester_id, text="❌ Your chat request was rejected.")
-            except Exception:
-                pass
+                await context.bot.send_message(
+                    chat_id=requester_id, 
+                    text="❌ Your chat request was rejected."
+                )
+            except Exception as e:
+                logger.error(f"Error notifying requester of rejection: {e}")
+                
             await query.message.edit_text("You rejected the chat request.")
             return
-        # Approve
-        sess['status'] = 'active'
-        CHAT_PEERS[owner_id] = {'peer_id': requester_id, 'session_id': session_id}
-        CHAT_PEERS[requester_id] = {'peer_id': owner_id, 'session_id': session_id}
-        leave_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🚪 Leave Chat", callback_data=f"leavechat_{session_id}")]
-        ])
-        try:
-            await context.bot.send_message(chat_id=requester_id, text="✅ Anonymous chat started. Say hi!", reply_markup=leave_keyboard)
-        except Exception:
-            pass
-        await query.message.edit_text("✅ Chat approved. You can now chat anonymously.", reply_markup=leave_keyboard)
-        return
+            
+        elif action == 'approvechat':
+            sess['status'] = 'active'
+            
+            # Notify both parties that the chat is active
+            try:
+                # Notify the requester
+                await context.bot.send_message(
+                    chat_id=requester_id,
+                    text=(
+                        "✅ Your chat request was approved!\n\n"
+                        "You can now chat anonymously. Type /endchat to end the conversation."
+                    )
+                )
+                
+                # Notify the owner
+                await query.message.edit_text(
+                    "✅ Chat started! You can now chat anonymously.\n"
+                    "Type /endchat to end the conversation."
+                )
+                
+                # Store the active chat session
+                ACTIVE_CHATS[requester_id] = owner_id
+                ACTIVE_CHATS[owner_id] = requester_id
+                
+            except Exception as e:
+                logger.error(f"Error starting chat session: {e}")
+                await query.message.reply_text("❌ Failed to start chat. Please try again.")
+                
+            return
 
-    # Leave chat
-    if query.data and query.data.startswith('leavechat_'):
+    # Handle leave chat request
+    if update.callback_query and update.callback_query.data.startswith('leavechat_'):
+        query = update.callback_query
+        await query.answer()
+        
         _, session_id = query.data.split('_', 1)
         sess = CHAT_SESSIONS.get(session_id)
+        
         if not sess:
             await query.message.reply_text("❌ Chat session not found.")
             return
+            
         if sess.get('status') != 'active':
             await query.message.reply_text("ℹ️ This chat is already closed.")
             return
+            
+        user_id = update.effective_user.id
         owner_id = sess['owner_id']
         requester_id = sess['requester_id']
+        
+        # Update session status
         sess['status'] = 'ended'
-        for uid in [owner_id, requester_id]:
-            CHAT_PEERS.pop(uid, None)
+        
+        # Remove from active chats
+        if user_id in ACTIVE_CHATS:
+            del ACTIVE_CHATS[user_id]
+        
+        # Notify the other participant if they're still in the chat
         try:
-            peer = requester_id if update.effective_user.id == owner_id else owner_id
-            await context.bot.send_message(chat_id=peer, text="ℹ️ The other person left the chat.")
-        except Exception:
-            pass
-        await query.message.edit_text("🚪 You left the chat.")
+            peer_id = requester_id if user_id == owner_id else owner_id
+            
+            # Check if peer is still in the chat
+            if peer_id in ACTIVE_CHATS and ACTIVE_CHATS[peer_id] == user_id:
+                await context.bot.send_message(
+                    chat_id=peer_id,
+                    text="ℹ️ The other person has left the chat. The chat is now closed."
+                )
+                # Remove peer from active chats
+                del ACTIVE_CHATS[peer_id]
+                
+        except Exception as e:
+            logger.error(f"Error notifying peer about chat end: {e}")
+        
+        # Update the message to show the chat has ended
+        await query.message.edit_text(
+            "🚪 You have left the chat.\n\n"
+            "Type /start to return to the main menu."
+        )
         return
 
     # Handle reply entry flow
@@ -330,23 +443,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("❌ Failed to save your reply. Please try again later.")
             return
 
-        # Clear reply state
-        context.user_data.pop('awaiting_reply', None)
-        context.user_data.pop('parent_comment_id', None)
+        # Handle cancel button
+        if update.message.text in ['❌ cancel', 'cancel']:
+            if 'awaiting_confession' in context.user_data:
+                # Clear all confession-related data
+                context.user_data.pop('awaiting_confession', None)
+                context.user_data.pop('confession_stage', None)
+                context.user_data.pop('confession_text', None)
+                
+                await update.message.reply_text(
+                    "❌ Confession cancelled.",
+                    reply_markup=ReplyKeyboardMarkup(
+                        [['📝 Confess', '👤 Bio'], ['❓ Help']],
+                        resize_keyboard=True
+                    )
+                )
+                return
 
-        await update.message.reply_text(
-            "✅ Your reply has been submitted.",
-            reply_markup=ReplyKeyboardMarkup(
-                [['📝 Confess', '👤 Bio'], ['❓ Help']],
-                resize_keyboard=True
-            )
-        )
-        return
-
-    # If user already accepted rules, show main menu; otherwise show rules
-    if context.user_data.get('rules_accepted', False):
-        await show_main_menu(update, context)
-    else:
+        # If user already accepted rules, show main menu; otherwise show rules
+        if context.user_data.get('rules_accepted', False):
+            await show_main_menu(update, context)
+        else:
+            await show_rules(update, context)
+        logger.info(f"/start completed in { (time.perf_counter()-t0)*1000:.1f} ms")
         await show_rules(update, context)
     logger.info(f"/start completed in { (time.perf_counter()-t0)*1000:.1f} ms")
 
@@ -511,8 +630,8 @@ async def button_click(update: Update, context: CallbackContext) -> None:
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show the main menu with reply keyboard."""
     keyboard = [
-        ["📝 Confess"],
-        ["👤 Bio", "❓ Help"]
+        ["📝 Confess", "👤 Profile"],
+        ["❓ Help"]
     ]
     
     reply_markup = ReplyKeyboardMarkup(
@@ -524,13 +643,17 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Check if this is a callback query or a message
     if update.callback_query:
         await update.callback_query.message.reply_text(
+            "🏠 *Main Menu*\n\n"
             "Please choose an option:",
-            reply_markup=reply_markup
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
         )
     else:
         await update.message.reply_text(
+            "🏠 *Main Menu*\n\n"
             "Please choose an option:",
-            reply_markup=reply_markup
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
         )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -540,9 +663,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "🤖 <b>Confession Bot Help</b>\n\n"
         "<b>Available Commands:</b>\n"
         "📝 <b>Confess</b> - Submit an anonymous confession\n"
-        "👤 <b>Bio</b> - Set or update your bio\n"
-        "❓ <b>Help</b> - Show this help message\n"
-        "\nJust type or tap the commands above to get started!"
+        "👤 <b>Profile</b> - View your profile and history\n"
+        "   • <b>History</b> - View your past confessions\n"
+        "   • <b>Customization</b> - Customize your profile\n"
+        "      - <b>Emoji</b> - Change your profile emoji\n"
+        "      - <b>Nickname</b> - Change your display name\n"
+        "      - <b>Bio</b> - Set or update your bio\n"
+        "❓ <b>Help</b> - Show this help message\n\n"
+        "Tap the buttons below to get started!"
     )
     
     if update.effective_user.id in ADMIN_IDS:
@@ -625,75 +753,112 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     # Check if user is in the middle of making a confession
     if context.user_data.get('awaiting_confession'):
-        # Process the confession text
-        confession_text = update.message.text
-        
-        # Save confession to database
-        from database import db
-        confession = {
-            "user_id": user.id,
-            "username": user.username or "Anonymous",
-            "text": confession_text,  # Changed from 'confession' to 'text' to match schema
-            "status": "pending",
-            "created_at": update.message.date,
-            "updated_at": update.message.date
-        }
-        
-        # Use the existing database instance (synchronous operation)
-        collection = db.get_collection('confessions')
-        result = collection.insert_one(confession)
-        confession_id = str(result.inserted_id)
-
-        # Create approval buttons for admin
-        keyboard = [
-            [
-                InlineKeyboardButton("✅ Approve", callback_data=f"approve_{confession_id}"),
-                InlineKeyboardButton("❌ Reject", callback_data=f"reject_{confession_id}"),
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        # Send to admin group for approval
-        from telegram.helpers import escape_markdown
-        
-        # Escape special characters in the confession text
-        escaped_confession = escape_markdown(confession_text, version=2)
-        
-        # Get user mention or 'Anonymous'
-        user_mention = f"@{user.username}" if user.username else 'Anonymous'
-        
-        admin_message = (
-            f"📨 *New Confession* \\(ID: `{confession_id}` \\)\n\n"
-            f"👤 *User:* {escape_markdown(user_mention, version=2)}\n"
-            f"🆔 *User ID:* `{user.id}`\n\n"
-            f"💬 *Confession:*\n{escaped_confession}"
-        )
-
-        await context.bot.send_message(
-            chat_id=ADMIN_GROUP_ID,
-            text=admin_message,
-            reply_markup=reply_markup,
-            parse_mode="MarkdownV2"
-        )
-
-        # Reset the state
-        context.user_data['awaiting_confession'] = False
-        
-        # Confirm to user
-        await update.message.reply_text(
-            "✅ Your confession has been received and is pending approval by admins. "
-            "It will be posted to the channel soon if approved.",
-            reply_markup=ReplyKeyboardMarkup(
-                [['📝 Confess', '👤 Bio'], ['❓ Help']],
-                resize_keyboard=True
+        # If we're in the text input stage
+        if context.user_data.get('confession_stage') == 'text':
+            # Save the confession text and move to category selection
+            context.user_data['confession_text'] = update.message.text
+            context.user_data['confession_stage'] = 'category'
+            
+            # Create a keyboard with category options
+            from models import Confession
+            categories = Confession.get_categories()
+            keyboard = [categories[i:i+2] for i in range(0, len(categories), 2)]  # 2 buttons per row
+            keyboard.append(['❌ Cancel'])
+            
+            await update.message.reply_text(
+                "📚 Please select a category for your confession:",
+                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
             )
-        )
-        return
+            return
+            
+        # If we're in the category selection stage
+        elif context.user_data.get('confession_stage') == 'category':
+            from models import Confession
+            
+            # Check if the selected category is valid
+            if Confession.is_valid_category(update.message.text):
+                # Get the confession text from context
+                confession_text = context.user_data.get('confession_text')
+                category = update.message.text
+                
+                # Save confession to database
+                from database import db
+                confession = {
+                    "user_id": user.id,
+                    "username": user.username or "Anonymous",
+                    "text": confession_text,
+                    "category": category,
+                    "status": "pending",
+                    "created_at": update.message.date,
+                    "updated_at": update.message.date
+                }
+                
+                # Use the existing database instance (synchronous operation)
+                collection = db.get_collection('confessions')
+                result = collection.insert_one(confession)
+                confession_id = str(result.inserted_id)
+    
+                # Create approval buttons for admin
+                keyboard = [
+                    [
+                        InlineKeyboardButton("✅ Approve", callback_data=f"approve_{confession_id}"),
+                        InlineKeyboardButton("❌ Reject", callback_data=f"reject_{confession_id}"),
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+    
+                # Send to admin group for approval
+                from telegram.helpers import escape_markdown
+                
+                # Escape special characters in the confession text
+                escaped_confession = escape_markdown(confession_text, version=2)
+                
+                # Get user mention or 'Anonymous'
+                user_mention = f"@{user.username}" if user.username else 'Anonymous'
+                
+                admin_message = (
+                    f"📨 *New Confession* \\(ID: `{confession_id}` \\)\n"
+                    f"🏷️ *Category:* `{category}`\n"
+                    f"👤 *User:* {escape_markdown(user_mention, version=2)}\n"
+                    f"🆔 *User ID:* `{user.id}`\n\n"
+                    f"💬 *Confession:*\n{escaped_confession}"
+                )
+    
+                await context.bot.send_message(
+                    chat_id=ADMIN_GROUP_ID,
+                    text=admin_message,
+                    reply_markup=reply_markup,
+                    parse_mode="MarkdownV2"
+                )
+    
+                # Reset the state
+                context.user_data.pop('awaiting_confession', None)
+                context.user_data.pop('confession_stage', None)
+                context.user_data.pop('confession_text', None)
+                
+                # Confirm to user
+                await update.message.reply_text(
+                    f"✅ Your confession has been received and is pending approval by admins.\n"
+                    f"Category: {category}",
+                    reply_markup=ReplyKeyboardMarkup(
+                        [['📝 Confess', '👤 Bio'], ['❓ Help']],
+                        resize_keyboard=True
+                    )
+                )
+                return
+                
+            else:
+                # Invalid category selected
+                await update.message.reply_text(
+                    "❌ Invalid category selected. Please select a valid category from the options."
+                )
+                return
     
     # Handle main menu buttons
     if '📝 confess' in text or 'confess' in text:
         # Set state to await confession
         context.user_data['awaiting_confession'] = True
+        context.user_data['confession_stage'] = 'text'  # Track confession stage
         await update.message.reply_text(
             "✍️ Please type your confession. It will be reviewed by admins before posting.",
             reply_markup=ReplyKeyboardMarkup(
@@ -702,24 +867,220 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
         )
         return
+        
+    # Handle bio update
+    if 'awaiting_bio' in context.user_data and context.user_data['awaiting_bio']:
+        bio = update.message.text
+        if len(bio) > 500:
+            await update.message.reply_text("❌ Bio is too long. Please keep it under 500 characters.")
+            return
             
-    elif '👤 bio' in text or 'bio' in text:
-        # Check if user already has a bio
-        user_data = User.get_user(user.id)
-        if user_data and 'bio' in user_data:
+        # Update bio in database
+        from models import User
+        success = User.update_user_bio(update.effective_user.id, bio)
+        
+        if success:
+            # Show profile menu after update
+            keyboard = [
+                ['📜 History'],
+                ['⚙️ Customization'],
+                ['🔙 Back to Main Menu']
+            ]
             await update.message.reply_text(
-                f"📝 <b>Your current bio:</b>\n{user_data['bio']}\n\n"
-                "Please send your new bio (max 500 characters):",
-                parse_mode='HTML',
-                reply_markup=ReplyKeyboardMarkup([['❌ Cancel']], resize_keyboard=True)
+                "✅ Your bio has been updated!",
+                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
             )
         else:
+            await update.message.reply_text("❌ Failed to update bio. Please try again.")
+            
+        # Clear the state
+        context.user_data.pop('awaiting_bio', None)
+        return
+        
+    # Handle nickname update
+    if 'awaiting_nickname' in context.user_data and context.user_data['awaiting_nickname']:
+        nickname = update.message.text.strip()
+        if not nickname:
+            await update.message.reply_text("❌ Nickname cannot be empty. Please try again.")
+            return
+            
+        # Update nickname in database
+        from models import User
+        success = User.update_user_nickname(update.effective_user.id, nickname)
+        
+        if success:
+            # Show profile menu after update
+            keyboard = [
+                ['📜 History'],
+                ['⚙️ Customization'],
+                ['🔙 Back to Main Menu']
+            ]
             await update.message.reply_text(
-                "👋 Welcome! Please write a short bio (max 500 characters) "
-                "that will be shown with your comments:",
-                reply_markup=ReplyKeyboardMarkup([['❌ Cancel']], resize_keyboard=True)
+                f"✅ Your nickname has been updated to: {nickname}",
+                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
             )
+        else:
+            await update.message.reply_text("❌ Failed to update nickname. Please try again.")
+            
+        # Clear the state
+        context.user_data.pop('awaiting_nickname', None)
+        return
+        
+    # Handle emoji selection from the emoji picker
+    if text in ['😊', '😎', '🤩', '😍', '😇', '🤠', '🤓', '😺', '🐶', '🦊', '🐼']:
+        # Update user's profile emoji in the database
+        from models import User
+        success = User.update_user_emoji(update.effective_user.id, text)
+        
+        if success:
+            # Show profile menu after update
+            keyboard = [
+                ['📜 History'],
+                ['⚙️ Customization'],
+                ['🔙 Back to Main Menu']
+            ]
+    elif '👤 profile' in text or 'profile' in text:
+        from models import User
+        profile = User.get_user_profile(update.effective_user.id)
+        
+        # Build profile info text
+        profile_text = (
+            f"👤 *Your Profile*\n\n"
+            f"{profile['emoji']} *{profile['nickname']}*\n"
+            f"📝 *Confessions:* {profile['confession_count']}\n\n"
+        )
+        
+        if profile.get('bio'):
+            profile_text += f"*Bio:*\n{profile['bio']}\n\n"
+            
+        keyboard = [
+            ['📜 History'],
+            ['⚙️ Customization'],
+            ['🔙 Back to Main Menu']
+        ]
+        
+        await update.message.reply_text(
+            profile_text,
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
+            parse_mode="Markdown"
+        )
+        return
+        
+    elif '⚙️ customization' in text or 'customization' in text:
+        keyboard = [
+            ['😀 Change Profile Emoji'],
+            ['📝 Change Nickname'],
+            ['✏️ Set/Update Bio'],
+            ['🔙 Back to Profile']
+        ]
+        await update.message.reply_text(
+            "⚙️ *Profile Customization*\n\n"
+            "Customize your profile:",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
+            parse_mode="Markdown"
+        )
+        return
+        
+    elif '🔙 back to profile' in text or 'back to profile' in text:
+        keyboard = [
+            ['📜 History'],
+            ['⚙️ Customization'],
+            ['🔙 Back to Main Menu']
+        ]
+        await update.message.reply_text(
+            "👤 *Profile Menu*\n\n"
+            "What would you like to do?",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
+            parse_mode="Markdown"
+        )
+        return
+        
+    elif '🔙 back to main menu' in text or 'back to main menu' in text:
+        keyboard = [
+            ['📝 Confess', '👤 Profile'],
+            ['❓ Help']
+        ]
+        await update.message.reply_text(
+            "🏠 *Main Menu*\n\n"
+            "What would you like to do?",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
+            parse_mode="Markdown"
+        )
+        return
+        
+    elif '✏️ set/update bio' in text or 'set/update bio' in text:
+        await update.message.reply_text(
+            "✏️ Please send me your bio (max 500 characters)."
+        )
         context.user_data['awaiting_bio'] = True
+        return
+        
+    elif '📝 change nickname' in text or 'change nickname' in text:
+        await update.message.reply_text(
+            "📝 Please send me your new nickname (max 20 characters)."
+        )
+        context.user_data['awaiting_nickname'] = True
+        return
+        
+    elif '😀 change profile emoji' in text or 'change profile emoji' in text:
+        keyboard = [
+            ['😊', '😎', '🤩', '😍'],
+            ['😇', '🤠', '🤓', '😎'],
+            ['😺', '🐶', '🦊', '🐼'],
+            ['🔙 Back to Customization']
+        ]
+        await update.message.reply_text(
+            "😀 *Choose a Profile Emoji*\n\n"
+            "Select an emoji for your profile:",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
+            parse_mode="Markdown"
+        )
+        return
+        
+    elif '📝 change nickname' in text or 'change nickname' in text:
+        await update.message.reply_text(
+            "📝 Please send me your new nickname (max 20 characters)."
+        )
+        context.user_data['awaiting_nickname'] = True
+        return
+        
+    elif '😀 change profile emoji' in text or 'change profile emoji' in text:
+        keyboard = [
+            ['😊', '😎', '🤩', '😍'],
+            ['😇', '🤠', '🤓', '😎'],
+            ['😺', '🐶', '🦊', '🐼'],
+            ['🔙 Back to Customization']
+        ]
+        await update.message.reply_text(
+            "😀 *Choose a Profile Emoji*\n\n"
+            "Select an emoji for your profile:",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
+            parse_mode="Markdown"
+        )
+        return
+        
+    elif '📜 history' in text or 'history' in text:
+        # Get user's confessions
+        user_id = update.effective_user.id
+        confessions = db.get_collection('confessions').find({
+            'user_id': user_id,
+            'status': 'approved'
+        }).sort('created_at', -1).limit(10)
+        
+        if not confessions:
+            await update.message.reply_text("📜 You don't have any approved confessions yet.")
+            return
+            
+        response = "📜 *Your Confession History*\n\n"
+        for idx, conf in enumerate(confessions, 1):
+            preview = conf['text'][:30] + '...' if len(conf['text']) > 30 else conf['text']
+            response += f"{idx}. {preview}\n"
+            
+        await update.message.reply_text(
+            response,
+            parse_mode="Markdown"
+        )
+        return
         
     elif '❓ help' in text or 'help' in text:
         await help_command(update, context)
@@ -777,27 +1138,88 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 def main() -> None:
     """Start the bot."""
+    # Load environment variables
+    load_dotenv()
+    
+    # Check if MongoDB URI is set
+    if not os.getenv('MONGODB_URI'):
+        raise ValueError("MONGODB_URI environment variable not set")
+    
+    # Database is already initialized when the db object is created
+    logger.info("Database connection initialized")
+    
     # Create the Application
     application = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN')).build()
 
-    # Add handlers
+    # Add error handler
+    application.add_error_handler(error_handler)
+
+    # Add conversation handler for confessions
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('confess', handle_confession)],
+        states={
+            TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_confession_text)
+            ],
+            CATEGORY: [
+                CallbackQueryHandler(save_confession, pattern=r'^category_\d+$')
+            ]
+        },
+        fallbacks=[
+            CommandHandler('cancel', cancel_confession),
+            MessageHandler(filters.ALL, handle_confession)  # Handle any other input
+        ],
+        allow_reentry=True
+    )
+    application.add_handler(conv_handler)
+    
+    # Add other command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("confess", handle_confession))
+    application.add_handler(CommandHandler("profile", show_profile))
+    application.add_handler(CommandHandler("settings", show_settings))
+    
     # Pre-log every incoming update and callback (runs before other handlers)
     application.add_handler(MessageHandler(filters.ALL, log_incoming), group=-1)
     application.add_handler(CallbackQueryHandler(log_callback, pattern=r'.*'), group=-1)
+    
     # Route callback queries specifically to avoid conflicts
     # Comment-related and rules acceptance callbacks
-    application.add_handler(CallbackQueryHandler(button_click, pattern=r'^(showcomments|addcomment|like|dislike|reply|reportc|requestc|approvechat|rejectchat|leavechat)_|^accept_rules$'))
+    application.add_handler(CallbackQueryHandler(
+        button_click, 
+        pattern=r'^(showcomments|addcomment|like|dislike|reply|reportc|requestc)_|^accept_rules$'
+    ))
+    
+    # Add a message handler for text input
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
+    
     # Confession approval/rejection callbacks
-    application.add_handler(CallbackQueryHandler(button_callback, pattern=r'^(approve|reject)_'))
+    application.add_handler(CallbackQueryHandler(
+        button_callback, 
+        pattern=r'^(approve|reject)_'
+    ))
+    
+    # Profile and settings callbacks
+    application.add_handler(CallbackQueryHandler(
+        handle_profile_callback,
+        pattern=r'^(edit_profile|change_emoji|change_nickname|change_bio|view_stats|back_to_profile)$'
+    ))
     
     # Add message handler for text messages (for the reply keyboard)
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND,
         handle_text_input
     ))
+    
+    # Log bot startup
+    logger.info("Starting bot...")
+    
+    # Start the Bot
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    
+    # Clean up on shutdown
+    logger.info("Bot is shutting down...")
+    db.close_connection()
 
     # Log any errors
     application.add_error_handler(error_handler)
@@ -806,6 +1228,164 @@ def main() -> None:
     logger.info("Bot is starting...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
+
+async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the user's profile."""
+    user = update.effective_user
+    user_data = await db.get_user(user.id)
+    
+    if not user_data:
+        # Create user if they don't exist
+        user_data = {
+            'user_id': user.id,
+            'first_name': user.first_name,
+            'last_name': user.last_name,
+            'username': user.username,
+            'emoji': '👤',
+            'bio': 'No bio set. Use /bio to set your bio.'
+        }
+        await db.create_user(user_data)
+    
+    # Build the profile message
+    profile_text = (
+        f"👤 *Profile*\n\n"
+        f"*Name*: {user_data.get('first_name', '')} {user_data.get('last_name', '')}\n"
+        f"*Username*: @{user_data.get('username', 'N/A')}\n"
+        f"*Bio*: {user_data.get('bio', 'No bio set. Use /bio to set your bio.')}\n"
+    )
+    
+    # Create inline keyboard for profile actions
+    keyboard = [
+        [
+            InlineKeyboardButton("✏️ Edit Bio", callback_data="edit_bio"),
+            InlineKeyboardButton("🔄 Refresh", callback_data="refresh_profile")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        profile_text,
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+async def handle_profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle profile-related callbacks."""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "edit_bio":
+        await query.message.reply_text("Please enter your new bio:")
+        # Set a state to handle the bio update
+        context.user_data['waiting_for_bio'] = True
+    elif query.data == "refresh_profile":
+        # Refresh the profile
+        await show_profile(update, context)
+
+async def ask_for_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show category selection keyboard."""
+    try:
+        print("ask_for_category called")  # Debug log
+        
+        # Create keyboard with categories
+        keyboard = []
+        print(f"Creating keyboard with {len(CATEGORIES)} categories")  # Debug log
+        
+        # Create two buttons per row
+        for i in range(0, len(CATEGORIES), 2):
+            row = []
+            row.append(InlineKeyboardButton(CATEGORIES[i], callback_data=f"category_{i}"))
+            if i + 1 < len(CATEGORIES):
+                row.append(InlineKeyboardButton(CATEGORIES[i+1], callback_data=f"category_{i+1}"))
+            keyboard.append(row)
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        print("Created reply markup")  # Debug log
+        
+        message_text = "📝 Please select a category for your confession:"
+        
+        if update.callback_query:
+            print("Handling callback query")  # Debug log
+            await update.callback_query.answer()
+            try:
+                await update.callback_query.edit_message_text(
+                    message_text,
+                    reply_markup=reply_markup
+                )
+                print("Edited message with category selection")  # Debug log
+            except Exception as e:
+                print(f"Error editing message: {str(e)}")  # Debug log
+                await update.callback_query.message.reply_text(
+                    message_text,
+                    reply_markup=reply_markup
+                )
+        else:
+            print("Sending new message")  # Debug log
+            try:
+                await update.message.reply_text(
+                    message_text,
+                    reply_markup=reply_markup
+                )
+                print("Sent category selection message")  # Debug log
+            except Exception as e:
+                print(f"Error sending message: {str(e)}")  # Debug log
+                raise
+                
+    except Exception as e:
+        print(f"Error in ask_for_category: {str(e)}")  # Debug log
+        error_message = "❌ An error occurred while showing categories. Please try again."
+        if update.callback_query:
+            await update.callback_query.message.reply_text(error_message)
+        elif update.message:
+            await update.message.reply_text(error_message)
+        return ConversationHandler.END
+
+async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the user's settings."""
+    try:
+        user = update.effective_user
+        user_data = User.get_user(user.id) or {}
+        
+        # Get current settings or use defaults
+        emoji = user_data.get('emoji', '👤')
+        nickname = user_data.get('nickname', 'Not set')
+        bio = user_data.get('bio', 'Not set')
+        
+        # Create settings keyboard
+        keyboard = [
+            [InlineKeyboardButton(f"✏️ Change Emoji (Current: {emoji})", callback_data="change_emoji")],
+            [InlineKeyboardButton(f"✏️ Change Nickname (Current: {nickname})", callback_data="change_nickname")],
+            [InlineKeyboardButton(f"✏️ Change Bio (Current: {bio[:20]}...)", callback_data="change_bio")],
+            [InlineKeyboardButton("⬅️ Back to Profile", callback_data="back_to_profile")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "⚙️ *Settings*\n\n"
+            "Here you can customize your profile settings.",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"Error in show_settings: {e}")
+        await update.message.reply_text("❌ An error occurred while loading settings. Please try again.")
+
+async def cancel_confession(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel the confession process and clean up all related data."""
+    # Clear all confession-related data
+    for key in ['awaiting_confession', 'confession_stage', 'confession_text']:
+        if key in context.user_data:
+            del context.user_data[key]
+    
+    # Send cancellation message with main menu
+    await update.message.reply_text(
+        '❌ Confession cancelled. What would you like to do next?',
+        reply_markup=ReplyKeyboardMarkup(
+            [['📝 Confess', '👤 Bio'], ['❓ Help']],
+            resize_keyboard=True
+        )
+    )
+    return ConversationHandler.END
 
 # Helper to refresh the channel button's comment count for a given confession
 async def refresh_channel_comment_count(confession_id: str, context: ContextTypes.DEFAULT_TYPE) -> None:
