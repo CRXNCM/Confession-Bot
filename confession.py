@@ -339,15 +339,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             from html import escape
             escaped_confession = escape(confession['text'])
             
-            # Get the category with a default value if not set
-            category = confession.get('category', '❓ Uncategorized')
+            # Get all categories or use 'Uncategorized' as default
+            categories = confession.get('categories', [])
+            if not categories:
+                categories = ['❓ Uncategorized']
+            
+            # Format all categories as hashtags (remove emojis, spaces, and special chars)
+            import re
+            def format_hashtag(cat):
+                return '#' + re.sub(r'[^\w]', '', cat.replace(' ', ''))
+                
+            category_hashtags = ' '.join([format_hashtag(cat) for cat in categories])
+            # Use the first category for display
+            category = categories[0]
             
             # Create the channel message with HTML formatting
             channel_message = (
                 f"💌 <b>Confession {confession_number}</b>\n"
-                f"🏷️ <i>{category}</i>\n\n"
+                
                 f"💬 {escaped_confession}\n\n"
-                f"#Confession{confession_number}"  # No need to escape in HTML mode
+                f"{category_hashtags} #Confession"  # No need to escape in HTML mode
             )
             
             try:
@@ -364,7 +375,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
                 comment_url = f"https://t.me/{bot_username}?start=comment_{confession_id}"
                 channel_keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton(f"💬 Comments ({comment_count})", url=comment_url)]
+                    [InlineKeyboardButton(f"💬 View / Add Comments ({comment_count})", url=comment_url)]
                 ])
                 # Send to channel
                 sent = await context.bot.send_message(

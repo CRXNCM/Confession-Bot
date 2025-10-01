@@ -110,16 +110,40 @@ class User:
 class Confession:
 
     CATEGORIES = [
-        "General",
-        "Love",
-        "Friendship",
-        "Family",
-        "Work",
-        "School",
-        "Confession",
-        "Advice",
-        "Rant",
-        "Other"
+        # General
+        "💬 General",
+        "💭 Confession",
+        "❓ Advice Needed",
+        "😊 Feel Good",
+        "😢 Need to Vent",
+        
+        # Relationships
+        "💖 Love & Relationships",
+        "💑 Secret Crush",
+        "💔 Heartbreak",
+        "💕 Dating",
+        "👫 Friends to Lovers",
+        
+        # 18+ Categories
+        "🔞 NSFW (18+)",
+        "😈 Kinks & Fetishes",
+        "🔥 Hot & Spicy",
+        "💋 First Time",
+        "🛏️ Bedroom Confessions",
+        "🎭 Roleplay Fantasies",
+        "👥 Threesomes & More",
+        "📸 Sexting Stories",
+        "💦 NSFW Confessions",
+        "🔐 Kinky Secrets",
+        
+        # Other Categories
+        "👨‍👩‍👧‍👦 Family Drama",
+        "💼 Work Stories",
+        "🎓 School/College",
+        "👯 Friendship",
+        "🤔 Random Thoughts",
+        "😡 Pet Peeves",
+        "🎉 Celebrations"
     ]
 
     @staticmethod
@@ -131,21 +155,42 @@ class Confession:
     def is_valid_category(category: str) -> bool:
         """Check if a category is valid."""
         return category in Confession.CATEGORIES
+        
+    @staticmethod
+    def get_category_hashtags(categories: List[str]) -> str:
+        """Convert a list of categories into hashtags."""
+        return ' '.join([f"#{cat.replace(' ', '').replace('-', '')}" for cat in categories])
 
     @staticmethod
     def create_confession(confession_data: Dict) -> Dict:
         """Create a new confession with category validation."""
-        # Set default category if not provided
-        if 'category' not in confession_data or not confession_data['category']:
-            confession_data['category'] = "General"
+        # Convert single category to list if needed (for backward compatibility)
+        if 'category' in confession_data and 'categories' not in confession_data:
+            confession_data['categories'] = [confession_data.pop('category')]
+            
+        # Ensure categories is a list
+        if 'categories' not in confession_data or not confession_data['categories']:
+            confession_data['categories'] = ["💬 General"]
         
-        # Validate category
-        if not Confession.is_valid_category(confession_data['category']):
-            confession_data['category'] = "General"  # Default to General if invalid
+        # Validate categories and filter out invalid ones
+        valid_categories = [cat for cat in confession_data['categories'] 
+                          if Confession.is_valid_category(cat)]
+                          
+        # If no valid categories, use default
+        if not valid_categories:
+            valid_categories = ["💬 General"]
+            
+        confession_data['categories'] = valid_categories
+        
+        # Add hashtags to the confession text
+        if 'text' in confession_data:
+            hashtags = Confession.get_category_hashtags(valid_categories)
+            confession_data['text'] = f"{confession_data['text']}\n\n{hashtags}"
             
         confession_data["status"] = "pending"
         confession_data["created_at"] = datetime.utcnow()
         confession_data["updated_at"] = datetime.utcnow()
+        
         result = CONFESSIONS_COLLECTION.insert_one(confession_data)
         return CONFESSIONS_COLLECTION.find_one({"_id": result.inserted_id})
     

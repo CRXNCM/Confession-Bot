@@ -2,10 +2,84 @@ import os
 import logging
 import time
 import uuid
+import sys
+from pathlib import Path
+from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 from database import db
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from config import ADMIN_GROUP_ID, CHANNEL_ID
+
+# Create logs directory if it doesn't exist
+log_dir = Path('logs')
+log_dir.mkdir(exist_ok=True)
+
+class CustomFormatter(logging.Formatter):
+    """Custom formatter with colors and cleaner output"""
+    grey = "\x1b[38;20m"
+    yellow = "\x1b[33;20m"
+    red = "\x1b[31;20m"
+    bold_red = "\x1b[31;1m"
+    blue = "\x1b[34;20m"
+    reset = "\x1b[0m"
+    
+    COLORS = {
+        logging.DEBUG: blue,
+        logging.INFO: grey,
+        logging.WARNING: yellow,
+        logging.ERROR: red,
+        logging.CRITICAL: bold_red
+    }
+    
+    def format(self, record):
+        # Shorten logger name to just the last part after the last dot
+        if '.' in record.name:
+            record.name = record.name.split('.')[-1]
+        
+        # Apply color based on log level
+        color = self.COLORS.get(record.levelno, self.grey)
+        record.levelname = f"{color}{record.levelname}{self.reset}"
+        record.name = f"{self.blue}{record.name}{self.reset}"
+        
+        return super().format(record)
+
+# Configure root logger
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Console handler with custom formatter
+console = logging.StreamHandler(sys.stdout)
+console_formatter = logging.Formatter(
+    '%(asctime)s | %(name)-12s | %(levelname)-8s | %(message)s',
+    datefmt='%H:%M:%S'
+)
+console.setFormatter(CustomFormatter('%(asctime)s | %(name)-12s | %(levelname)-8s | %(message)s',
+                                  datefmt='%H:%M:%S'))
+
+# File handler with rotation
+file_handler = RotatingFileHandler(
+    log_dir / 'bot.log',
+    maxBytes=5*1024*1024,  # 5MB
+    backupCount=3,
+    encoding='utf-8'
+)
+file_handler.setFormatter(logging.Formatter(
+    '%(asctime)s | %(name)-12s | %(levelname)-8s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+))
+
+# Add handlers
+logger.addHandler(console)
+logger.addHandler(file_handler)
+
+# Suppress noisy loggers
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
+logging.getLogger('telegram').setLevel(logging.WARNING)
+logging.getLogger('apscheduler').setLevel(logging.WARNING)
+
+# Get logger for this module
+logger = logging.getLogger(__name__)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -447,12 +521,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.message.text in ['❌ cancel', 'cancel']:
             if 'awaiting_confession' in context.user_data:
                 # Clear all confession-related data
-                context.user_data.pop('awaiting_confession', None)
-                context.user_data.pop('confession_stage', None)
-                context.user_data.pop('confession_text', None)
+                for key in ['awaiting_confession', 'confession_stage', 'confession_text', 'confession_category']:
+                    if key in context.user_data:
+                        del context.user_data[key]
                 
                 await update.message.reply_text(
-                    "❌ Confession cancelled.",
+                    "❌ Confession cancelled. What would you like to do next?",
                     reply_markup=ReplyKeyboardMarkup(
                         [['📝 Confess', '👤 Bio'], ['❓ Help']],
                         resize_keyboard=True
@@ -498,6 +572,127 @@ async def button_click(update: Update, context: CallbackContext) -> None:
         )
         await show_main_menu(update, context)
         return
+
+    # Handle confession preview callbacks
+    if query.data == 'preview_submit':
+        # Get confession data from user_data
+        confession_text = context.user_data.get('confession_text')
+        selected_categories = context.user_data.get('selected_categories', ['Uncategorized'])
+        
+        # Get user info
+        user = query.from_user
+        
+        # Save confession to database
+        from database import db
+        from models import Confession
+        from telegram.helpers import escape_markdown
+        
+        # Get category hashtags
+        category_hashtags = Confession.get_category_hashtags(selected_categories)
+        
+        # Save to database
+        confession = {
+            "user_id": user.id,
+            "username": user.username or "Anonymous",
+            "text": confession_text,
+            "categories": selected_categories,
+            "hashtags": category_hashtags,
+            "status": "pending",
+            "created_at": query.message.date,
+            "updated_at": query.message.date
+        }
+        
+        collection = db.get_collection('confessions')
+        result = collection.insert_one(confession)
+        confession_id = str(result.inserted_id)
+        
+        # Create approval buttons for admin
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Approve", callback_data=f"approve_{confession_id}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"reject_{confession_id}"),
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Send to admin group
+        user_mention = f"@{user.username}" if user.username else 'Anonymous'
+        escaped_categories = [escape_markdown(cat, version=2) for cat in selected_categories]
+        categories_text = ', '.join([f'`{cat}`' for cat in escaped_categories])
+        
+        # Escape all special characters in the message
+        escaped_id = escape_markdown(str(confession_id), version=2)
+        escaped_mention = escape_markdown(user_mention, version=2)
+        escaped_confession = escape_markdown(confession_text, version=2)
+        
+        # Escape hashtags and other special characters
+        escaped_hashtags = escape_markdown(category_hashtags, version=2)
+        # Replace # with \# for MarkdownV2
+        escaped_hashtags = escaped_hashtags.replace('#', '\#')
+        
+        # Build the message parts with proper escaping
+        message_parts = [
+            "📨 *New Confession* \\(ID: `" + escaped_id + "`\\)",
+            "🏷️ *Categories:* " + categories_text,
+            "👤 *User:* " + escaped_mention,
+            "🆔 *User ID:* `" + str(user.id) + "`",
+            "",  # Empty line for spacing
+            "💬 *Confession:*",
+            escaped_confession,
+            "",  # Empty line for spacing
+            "🔖 *Tags:* `" + escaped_hashtags + "`"
+        ]
+        
+        # Join with newlines
+        admin_message = "\n".join(message_parts)
+        
+        try:
+            from config import ADMIN_GROUP_ID
+            await context.bot.send_message(
+                chat_id=ADMIN_GROUP_ID,
+                text=admin_message,
+                reply_markup=reply_markup,
+                parse_mode="MarkdownV2"
+            )
+            
+            # Show success message to user
+            await query.answer("Your confession has been submitted for review!")
+            await query.edit_message_text(
+                "✅ Your confession has been submitted for admin review.\n\n"
+                "We'll notify you once it's approved and posted.",
+                reply_markup=None
+            )
+        except Exception as e:
+            logger.error(f"Error sending confession to admin: {e}")
+            await query.answer("❌ Failed to submit your confession. Please try again.", show_alert=True)
+            return
+        
+        # Clear the state
+        for key in ['awaiting_confession', 'confession_stage', 'confession_text', 'selected_categories']:
+            context.user_data.pop(key, None)
+            
+        return ConversationHandler.END
+        
+    elif query.data == 'preview_edit':
+        # Go back to text editing
+        context.user_data['confession_stage'] = 'text'
+        await query.edit_message_text(
+            "✏️ Please send me your confession text again. You can edit it now.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancel", callback_data="preview_cancel")]
+            ])
+        )
+        return TEXT  # Return to text input state
+        
+    elif query.data == 'preview_cancel':
+        # Clear everything
+        for key in ['awaiting_confession', 'confession_stage', 'confession_text', 'selected_categories']:
+            context.user_data.pop(key, None)
+        await query.edit_message_text(
+            "❌ Confession cancelled. Your message has been discarded.",
+            reply_markup=None
+        )
+        return ConversationHandler.END
 
     # Handle comment-related callbacks
     if query.data and query.data.startswith('showcomments_'):
@@ -552,6 +747,68 @@ async def button_click(update: Update, context: CallbackContext) -> None:
             "💬 Please type your comment. It will be posted under the confession after review.",
             reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
         )
+        return
+
+    # Handle report comment
+    if query.data and query.data.startswith('reportc_'):
+        from bson import ObjectId
+        from models import Comment, Report
+        
+        try:
+            comment_id = query.data.split('_', 1)[1]
+            comment = Comment.get_comment(ObjectId(comment_id))
+            
+            if not comment:
+                await query.answer("Comment not found.", show_alert=True)
+                return
+                
+            # Check if user already reported this comment
+            existing_report = Report.get_report(
+                reporter_id=query.from_user.id,
+                comment_id=ObjectId(comment_id)
+            )
+            
+            if existing_report:
+                await query.answer("You've already reported this comment.", show_alert=True)
+                return
+                
+            # Create report
+            report = Report.create_report(
+                reporter_id=query.from_user.id,
+                comment_id=ObjectId(comment_id),
+                comment_text=comment.get('text', '')
+            )
+            
+            if report:
+                # Notify admins
+                admin_message = (
+                    f"🚨 *New Comment Report*\n\n"
+                    f"📝 *Comment ID:* `{comment_id}`\n"
+                    f"👤 *Reported by:* {query.from_user.mention_markdown_v2()} "
+                    f"(ID: `{query.from_user.id}`)\n\n"
+                    f"💬 *Comment Text:*\n{comment.get('text', 'N/A')}"
+                )
+                
+                # Get admin IDs from environment variable
+                admin_ids = [int(id_str) for id_str in os.getenv('ADMIN_IDS', '').split(',') if id_str.strip().isdigit()]
+                
+                for admin_id in admin_ids:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=admin_id,
+                            text=admin_message,
+                            parse_mode='MarkdownV2'
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to send report to admin {admin_id}: {e}")
+                
+                await query.answer("Thank you for reporting. We'll review this comment.", show_alert=True)
+            else:
+                await query.answer("Failed to submit report. Please try again.", show_alert=True)
+                
+        except Exception as e:
+            logger.error(f"Error handling comment report: {e}")
+            await query.answer("An error occurred while processing your report.", show_alert=True)
         return
 
     # Handle reactions: like/dislike
@@ -753,118 +1010,200 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     # Check if user is in the middle of making a confession
     if context.user_data.get('awaiting_confession'):
-        # If we're in the text input stage
-        if context.user_data.get('confession_stage') == 'text':
-            # Save the confession text and move to category selection
-            context.user_data['confession_text'] = update.message.text
-            context.user_data['confession_stage'] = 'category'
+        current_stage = context.user_data.get('confession_stage')
+        
+        # If we're in the text editing stage (after preview)
+        if current_stage == 'text':
+            # Save the edited text
+            context.user_data['confession_text'] = text
             
-            # Create a keyboard with category options
-            from models import Confession
-            categories = Confession.get_categories()
-            keyboard = [categories[i:i+2] for i in range(0, len(categories), 2)]  # 2 buttons per row
-            keyboard.append(['❌ Cancel'])
-            
-            await update.message.reply_text(
-                "📚 Please select a category for your confession:",
-                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+            # Show the preview again
+            categories = context.user_data.get('selected_categories', ['Uncategorized'])
+            preview_text = (
+                f"📝 *Preview Your Confession (Edited)*\n\n"
+                f"📌 *Categories:* {', '.join(categories)}\n\n"
+                f"{text}"
             )
+            
+            keyboard = [
+                [InlineKeyboardButton("✅ Submit", callback_data="preview_submit")],
+                [InlineKeyboardButton("✏️ Edit", callback_data="preview_edit")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="preview_cancel")]
+            ]
+            
+            # Edit the original preview message or send a new one
+            try:
+                await update.message.reply_text(
+                    preview_text,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Error showing preview: {e}")
+                await update.message.reply_text("❌ An error occurred. Please try again.")
+            
             return
             
         # If we're in the category selection stage
-        elif context.user_data.get('confession_stage') == 'category':
+        elif current_stage == 'category':
             from models import Confession
             
-            # Check if the selected category is valid
-            if Confession.is_valid_category(update.message.text):
-                # Get the confession text from context
-                confession_text = context.user_data.get('confession_text')
-                category = update.message.text
-                
-                # Save confession to database
-                from database import db
-                confession = {
-                    "user_id": user.id,
-                    "username": user.username or "Anonymous",
-                    "text": confession_text,
-                    "category": category,
-                    "status": "pending",
-                    "created_at": update.message.date,
-                    "updated_at": update.message.date
-                }
-                
-                # Use the existing database instance (synchronous operation)
-                collection = db.get_collection('confessions')
-                result = collection.insert_one(confession)
-                confession_id = str(result.inserted_id)
-    
-                # Create approval buttons for admin
-                keyboard = [
-                    [
-                        InlineKeyboardButton("✅ Approve", callback_data=f"approve_{confession_id}"),
-                        InlineKeyboardButton("❌ Reject", callback_data=f"reject_{confession_id}"),
-                    ]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-    
-                # Send to admin group for approval
-                from telegram.helpers import escape_markdown
-                
-                # Escape special characters in the confession text
-                escaped_confession = escape_markdown(confession_text, version=2)
-                
-                # Get user mention or 'Anonymous'
-                user_mention = f"@{user.username}" if user.username else 'Anonymous'
-                
-                admin_message = (
-                    f"📨 *New Confession* \\(ID: `{confession_id}` \\)\n"
-                    f"🏷️ *Category:* `{category}`\n"
-                    f"👤 *User:* {escape_markdown(user_mention, version=2)}\n"
-                    f"🆔 *User ID:* `{user.id}`\n\n"
-                    f"💬 *Confession:*\n{escaped_confession}"
-                )
-    
-                await context.bot.send_message(
-                    chat_id=ADMIN_GROUP_ID,
-                    text=admin_message,
-                    reply_markup=reply_markup,
-                    parse_mode="MarkdownV2"
-                )
-    
-                # Reset the state
-                context.user_data.pop('awaiting_confession', None)
-                context.user_data.pop('confession_stage', None)
-                context.user_data.pop('confession_text', None)
-                
-                # Confirm to user
-                await update.message.reply_text(
-                    f"✅ Your confession has been received and is pending approval by admins.\n"
-                    f"Category: {category}",
-                    reply_markup=ReplyKeyboardMarkup(
-                        [['📝 Confess', '👤 Bio'], ['❓ Help']],
-                        resize_keyboard=True
+            # Initialize selected categories if not exists
+            if 'selected_categories' not in context.user_data:
+                context.user_data['selected_categories'] = []
+            
+            selected_categories = context.user_data['selected_categories']
+            
+            # Handle 'Done' button
+            if update.message.text.lower() == '✅ done':
+                if not selected_categories:
+                    await update.message.reply_text(
+                        "❌ Please select at least one category before continuing."
                     )
+                    return
+                    
+                context.user_data['confession_stage'] = 'text'
+                
+                # Format categories for display
+                categories_text = "\n".join([f"• {cat}" for cat in selected_categories])
+                
+                await update.message.reply_text(
+                    f"✍️ You've selected these categories:\n{categories_text}\n\n"
+                    "Now, please type your confession. It will be reviewed by admins before posting.",
+                    reply_markup=ReplyKeyboardMarkup(
+                        [['❌ Cancel']],
+                        resize_keyboard=True
+                    ),
+                    parse_mode='Markdown'
                 )
                 return
                 
+            # Handle category toggle
+            category = update.message.text
+            if Confession.is_valid_category(category):
+                # Toggle category selection
+                if category in selected_categories:
+                    selected_categories.remove(category)
+                    action = "removed"
+                else:
+                    selected_categories.append(category)
+                    action = "added"
+                
+                # Update the keyboard to show selected categories
+                from models import Confession
+                categories = Confession.get_categories()
+                keyboard = []
+                for i in range(0, len(categories), 2):
+                    row = []
+                    for j in range(2):
+                        if i + j < len(categories):
+                            cat = categories[i + j]
+                            prefix = "✅ " if cat in selected_categories else ""
+                            row.append(f"{prefix}{cat}")
+                    if row:
+                        keyboard.append(row)
+                
+                # Add Done button if at least one category is selected
+                if selected_categories:
+                    keyboard.append(['✅ Done'])
+                keyboard.append(['❌ Cancel'])
+                
+                await update.message.reply_text(
+                    f"{action.capitalize()}: *{category}*\n\n"
+                    "Select more categories or tap '✅ Done' when finished:",
+                    reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False),
+                    parse_mode='Markdown'
+                )
+                return
             else:
                 # Invalid category selected
                 await update.message.reply_text(
-                    "❌ Invalid category selected. Please select a valid category from the options."
+                    "❌ Please select a valid category from the options below."
                 )
                 return
+                
+        # If we're in the text input stage
+        elif context.user_data.get('confession_stage') == 'text':
+            # Get the categories from context
+            selected_categories = context.user_data.get('selected_categories', ['💬 General'])
+            confession_text = update.message.text
+            
+            # Get category hashtags using the model method
+            from models import Confession
+            category_hashtags = Confession.get_category_hashtags(selected_categories)
+            full_confession_text = f"{confession_text}\n\n{category_hashtags}"
+            
+            # Store confession data for preview
+            context.user_data['confession_text'] = confession_text
+            context.user_data['confession_hashtags'] = category_hashtags
+            
+            # Move to preview stage
+            context.user_data['confession_stage'] = 'preview'
+            
+            # Show preview with confirmation buttons
+            preview_text = (
+                f"📝 *Preview Your Confession*\n\n"
+                f"📌 *Categories:* {', '.join(selected_categories)}\n\n"
+                f"{text}"
+            )
+            
+            keyboard = [
+                [InlineKeyboardButton("✅ Submit", callback_data="preview_submit")],
+                [InlineKeyboardButton("✏️ Edit", callback_data="preview_edit")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="preview_cancel")]
+            ]
+            
+            await update.message.reply_text(
+                preview_text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
+            )
+            
+            # Return PREVIEW state to handle the callback
+            return 'PREVIEW'
+            
+        else:
+            # Invalid category selected
+            await update.message.reply_text(
+                "❌ Invalid category selected. Please select a valid category from the options."
+            )
+            return
     
     # Handle main menu buttons
     if '📝 confess' in text or 'confess' in text:
-        # Set state to await confession
+        # Set state to await category selection
         context.user_data['awaiting_confession'] = True
-        context.user_data['confession_stage'] = 'text'  # Track confession stage
+        context.user_data['confession_stage'] = 'category'
+        
+        # Get categories and create keyboard with checkboxes
+        from models import Confession
+        categories = Confession.get_categories()
+        
+        # Create a keyboard with 2 columns and checkboxes for selected categories
+        keyboard = []
+        for i in range(0, len(categories), 2):
+            row = []
+            for j in range(2):
+                if i + j < len(categories):
+                    cat = categories[i + j]
+                    # No categories are selected initially
+                    row.append(f"{cat}")
+            if row:
+                keyboard.append(row)
+        
+        # Add Done and Cancel buttons
+        keyboard.append(['❌ Cancel'])
+        
         await update.message.reply_text(
-            "✍️ Please type your confession. It will be reviewed by admins before posting.",
+            "📚 *Select categories for your confession:*\n\n"
+            "You can select multiple categories. Tap a category to select/deselect it, then tap '✅ Done' when finished.\n"
+            "This helps with organization and makes it easier for others to find your confession.",
             reply_markup=ReplyKeyboardMarkup(
-                [['❌ Cancel']],
-                resize_keyboard=True
-            )
+                keyboard,
+                resize_keyboard=True,
+                one_time_keyboard=False
+            ),
+            parse_mode='Markdown'
         )
         return
         
@@ -1137,96 +1476,127 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         logger.info(f"text input completed (fallback) in { (time.perf_counter()-t0)*1000:.1f} ms")
 
 def main() -> None:
-    """Start the bot."""
-    # Load environment variables
-    load_dotenv()
+    """
+    Start and run the Telegram bot with enhanced logging and error handling.
     
-    # Check if MongoDB URI is set
-    if not os.getenv('MONGODB_URI'):
-        raise ValueError("MONGODB_URI environment variable not set")
-    
-    # Database is already initialized when the db object is created
-    logger.info("Database connection initialized")
-    
-    # Create the Application
-    application = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN')).build()
-
-    # Add error handler
-    application.add_error_handler(error_handler)
-
-    # Add conversation handler for confessions
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('confess', handle_confession)],
-        states={
-            TEXT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_confession_text)
+    This function initializes the bot, sets up all necessary handlers,
+    and manages the bot's lifecycle with proper error handling and logging.
+    """
+    try:
+        logger.info("🚀 Initializing bot...")
+        
+        # Load environment variables
+        load_dotenv()
+        
+        # Validate required environment variables
+        required_vars = ['TELEGRAM_BOT_TOKEN', 'MONGODB_URI', 'ADMIN_IDS', 'CHANNEL_ID']
+        missing_vars = [var for var in required_vars if not os.getenv(var)]
+        if missing_vars:
+            raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+        
+        logger.info("✅ Environment variables loaded successfully")
+        
+        # Create the Application
+        application = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN')).build()
+        logger.debug("Application instance created")
+        
+        # ===== Setup Handlers =====
+        
+        # 1. Conversation Handler for confessions
+        conv_handler = ConversationHandler(
+            entry_points=[CommandHandler('confess', start)],
+            states={
+                TEXT: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input)
+                ],
+                CATEGORY: [
+                    CallbackQueryHandler(button_click, pattern=r'^category_\d+$')
+                ],
+                'PREVIEW': [
+                    CallbackQueryHandler(button_click, pattern='^preview_')  # Will be handled by button_click
+                ]
+            },
+            fallbacks=[
+                CommandHandler('cancel', cancel_confession),
+                MessageHandler(filters.ALL & ~filters.COMMAND, handle_text_input)  # Fallback to text input
             ],
-            CATEGORY: [
-                CallbackQueryHandler(save_confession, pattern=r'^category_\d+$')
-            ]
-        },
-        fallbacks=[
-            CommandHandler('cancel', cancel_confession),
-            MessageHandler(filters.ALL, handle_confession)  # Handle any other input
-        ],
-        allow_reentry=True
-    )
-    application.add_handler(conv_handler)
-    
-    # Add other command handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("profile", show_profile))
-    application.add_handler(CommandHandler("settings", show_settings))
-    
-    # Pre-log every incoming update and callback (runs before other handlers)
-    application.add_handler(MessageHandler(filters.ALL, log_incoming), group=-1)
-    application.add_handler(CallbackQueryHandler(log_callback, pattern=r'.*'), group=-1)
-    
-    # Route callback queries specifically to avoid conflicts
-    # Comment-related and rules acceptance callbacks
-    application.add_handler(CallbackQueryHandler(
-        button_click, 
-        pattern=r'^(showcomments|addcomment|like|dislike|reply|reportc|requestc)_|^accept_rules$'
-    ))
-    
-    # Add a message handler for text input
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
-    
-    # Confession approval/rejection callbacks
-    application.add_handler(CallbackQueryHandler(
-        button_callback, 
-        pattern=r'^(approve|reject)_'
-    ))
-    
-    # Profile and settings callbacks
-    application.add_handler(CallbackQueryHandler(
-        handle_profile_callback,
-        pattern=r'^(edit_profile|change_emoji|change_nickname|change_bio|view_stats|back_to_profile)$'
-    ))
-    
-    # Add message handler for text messages (for the reply keyboard)
-    application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        handle_text_input
-    ))
-    
-    # Log bot startup
-    logger.info("Starting bot...")
-    
-    # Start the Bot
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-    
-    # Clean up on shutdown
-    logger.info("Bot is shutting down...")
-    db.close_connection()
-
-    # Log any errors
-    application.add_error_handler(error_handler)
-
-    # Start the Bot
-    logger.info("Bot is starting...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+            allow_reentry=True,
+            per_message=True
+        )
+        application.add_handler(conv_handler)
+        
+        # Add preview callbacks with higher priority
+        application.add_handler(CallbackQueryHandler(
+            button_click, 
+            pattern='^preview_',
+            block=False
+        ), group=0)
+        
+        # 2. Command Handlers
+        command_handlers = [
+            ("start", start),
+            ("help", help_command),
+            ("profile", show_profile),
+            ("settings", show_settings)
+        ]
+        
+        for cmd, handler in command_handlers:
+            application.add_handler(CommandHandler(cmd, handler))
+        
+        # 3. Message Handlers
+        # Log all incoming messages (lowest priority group)
+        application.add_handler(MessageHandler(filters.ALL, log_incoming), group=-1)
+        
+        # Handle text messages (medium priority)
+        application.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_text_input
+        ))
+        
+        # 4. Callback Query Handlers
+        # Log all callbacks (lowest priority group)
+        application.add_handler(CallbackQueryHandler(log_callback, pattern=r'.*'), group=-1)
+        
+        # Comment-related and rules acceptance callbacks
+        application.add_handler(CallbackQueryHandler(
+            button_click, 
+            pattern=r'^(showcomments|addcomment|like|dislike|reply)_|^accept_rules$'
+        ))
+        
+        # Confession approval/rejection callbacks (admin only)
+        application.add_handler(CallbackQueryHandler(
+            button_callback, 
+            pattern=r'^(approve|reject)_'
+        ))
+        
+        # Profile and settings callbacks
+        application.add_handler(CallbackQueryHandler(
+            handle_profile_callback,
+            pattern=r'^(edit_profile|change_emoji|change_nickname|change_bio|view_stats|back_to_profile)$'
+        ))
+        
+        # Add error handler
+        application.add_error_handler(error_handler)
+        
+        # ===== Start the Bot =====
+        logger.info("✅ All handlers registered successfully")
+        logger.info("🔄 Starting bot... (Press Ctrl+C to stop)")
+        
+        # Run the bot
+        application.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+            close_loop=False
+        )
+        
+    except Exception as e:
+        logger.critical(f"❌ Fatal error in main: {e}", exc_info=True)
+        raise
+    finally:
+        # Cleanup and shutdown
+        logger.info("🛑 Bot is shutting down...")
+        # Add any cleanup code here if needed
+        # No need to explicitly close the connection as it's handled by the Database class
 
 
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
