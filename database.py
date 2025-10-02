@@ -163,6 +163,46 @@ class Database:
         except Exception as e:
             logger.error(f"Error getting stats: {e}")
             raise
+            
+    async def get_user_confessions(self, user_id: int, limit: int = 10) -> List[Dict]:
+        """Get confessions made by a specific user."""
+        try:
+            collection = self.get_collection('confessions')
+            return list(collection.find(
+                {'user_id': user_id},
+                sort=[('created_at', -1)],
+                limit=limit
+            ))
+        except Exception as e:
+            logger.error(f"Error getting confessions for user {user_id}: {e}")
+            return []
+            
+    async def get_user_comments(self, user_id: int, limit: int = 10) -> List[Dict]:
+        """Get comments made by a specific user."""
+        try:
+            collection = self.get_collection('comments')
+            return list(collection.find(
+                {'user_id': user_id},
+                sort=[('created_at', -1)],
+                limit=limit
+            ))
+        except Exception as e:
+            logger.error(f"Error getting comments for user {user_id}: {e}")
+            return []
+            
+    async def update_user_emoji(self, user_id: int, emoji: str) -> bool:
+        """Update user's profile emoji."""
+        try:
+            collection = self.get_collection('users')
+            result = collection.update_one(
+                {'user_id': user_id},
+                {'$set': {'emoji': emoji}},
+                upsert=True
+            )
+            return result.modified_count > 0 or result.upserted_id is not None
+        except Exception as e:
+            logger.error(f"Error updating emoji for user {user_id}: {e}")
+            return False
 
 # Singleton instance
 db = Database()

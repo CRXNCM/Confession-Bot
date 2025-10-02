@@ -112,37 +112,25 @@ class Confession:
     CATEGORIES = [
         # General
         "💬 General",
-        "💭 Confession",
         "❓ Advice Needed",
-        "😊 Feel Good",
         "😢 Need to Vent",
         
         # Relationships
         "💖 Love & Relationships",
-        "💑 Secret Crush",
-        "💔 Heartbreak",
-        "💕 Dating",
-        "👫 Friends to Lovers",
+        "👫 Friends",
         
         # 18+ Categories
-        "🔞 NSFW (18+)",
-        "😈 Kinks & Fetishes",
-        "🔥 Hot & Spicy",
-        "💋 First Time",
-        "🛏️ Bedroom Confessions",
-        "🎭 Roleplay Fantasies",
-        "👥 Threesomes & More",
-        "📸 Sexting Stories",
-        "💦 NSFW Confessions",
-        "🔐 Kinky Secrets",
+        "🔞 Adult",
+        "📸 Sexual Abuse",
+        "😑 Harassment",
+        "Other",
+        "Addiction",
+        "Exam",
         
         # Other Categories
-        "👨‍👩‍👧‍👦 Family Drama",
-        "💼 Work Stories",
+        "👨‍👩‍👧‍👦 Family",
         "🎓 School/College",
-        "👯 Friendship",
         "🤔 Random Thoughts",
-        "😡 Pet Peeves",
         "🎉 Celebrations"
     ]
 
@@ -259,10 +247,28 @@ class Comment:
 
     @staticmethod
     def add_reply(parent_comment_id: Any, reply_data: Dict) -> Dict:
-        reply_data["parent_comment_id"] = parent_comment_id
-        reply_data["created_at"] = datetime.utcnow()
-        reply_data["updated_at"] = datetime.utcnow()
-        reply_data.setdefault("likes", 0)
-        reply_data.setdefault("dislikes", 0)
-        result = COMMENTS_COLLECTION.insert_one(reply_data)
-        return COMMENTS_COLLECTION.find_one({"_id": result.inserted_id})
+        # Add reply to the replies array in the parent comment
+        result = COMMENTS_COLLECTION.update_one(
+            {"_id": parent_comment_id},
+            {
+                "$push": {
+                    "replies": {
+                        "$each": [{
+                            "user_id": reply_data["user_id"],
+                            "username": reply_data.get("username", ""),
+                            "first_name": reply_data.get("first_name", ""),
+                            "last_name": reply_data.get("last_name", ""),
+                            "text": reply_data["text"],
+                            "created_at": datetime.utcnow(),
+                            "likes": 0,
+                            "dislikes": 0
+                        }],
+                        "$position": 0  # Add to the beginning of the array
+                    }
+                },
+                "$inc": {"reply_count": 1},  # Increment reply count
+                "$set": {"updated_at": datetime.utcnow()}
+            },
+            upsert=False
+        )
+        return result
