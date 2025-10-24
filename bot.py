@@ -4,16 +4,19 @@ import time
 import uuid
 import sys
 import asyncio
+import telegram
 from datetime import datetime, timedelta
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 from bson import ObjectId
 from database import db
-from models import Comment
+from models import Comment, User
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import ContextTypes, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ConversationHandler
+from telegram.ext import ContextTypes, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ConversationHandler, Application
+from telegram.error import TimedOut, NetworkError, RetryAfter, BadRequest, ChatMigrated, Conflict, InvalidToken, TelegramError
 from config import ADMIN_GROUP_ID, CHANNEL_ID
+from keepalive import KeepAliveServer
 
 # Placeholder functions for profile features
 async def show_post_history(update: Update, context: ContextTypes.DEFAULT_TYPE, query: CallbackQuery = None) -> None:
@@ -225,11 +228,12 @@ logger = logging.getLogger(__name__)
 # Admin IDs (from .env)
 ADMIN_IDS = [int(id_str.strip()) for id_str in os.getenv('ADMIN_IDS', '').split(',') if id_str.strip().isdigit()]
 
-# In-memory anonymous chat sessions
-# CHAT_SESSIONS: session_id -> {requester_id, owner_id, status: 'pending'|'active'|'ended'}
-# CHAT_PEERS: user_id -> {peer_id, session_id}
-CHAT_SESSIONS = {}
-CHAT_PEERS = {}
+# Removed chat functionality
+# In-memory structures for chat/request flows. These were previously removed
+# accidentally; restore as empty dicts so chat-related handlers don't crash.
+CHAT_SESSIONS: Dict[str, dict] = {}
+ACTIVE_CHATS: Dict[int, int] = {}
+CHAT_PEERS: Dict[int, dict] = {}
 
 def _summarize_update(update: Update) -> str:
     try:
@@ -644,11 +648,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def button_click(update: Update, context: CallbackContext) -> None:
     """Handle button callbacks."""
     query = update.callback_query
-    await query.answer()
+    
+    # Log the callback data first
     try:
         logger.info(f"Callback received: {query.data}")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Error logging callback data: {e}")
+    
+    # Answer the callback query with error handling
+    try:
+        await query.answer()
+    except Exception as e:
+        logger.warning(f"Could not answer callback query: {e}")
+        # Continue processing even if answering fails
     
     if query.data == 'accept_rules':
         # Mark rules as accepted
@@ -847,10 +859,6 @@ async def button_click(update: Update, context: CallbackContext) -> None:
                     ],
                     [
                         InlineKeyboardButton("↩️ Reply", callback_data=f"reply_{comment_id}")
-                    ],
-                    [
-                        InlineKeyboardButton("🚩 Report", callback_data=f"reportc_{comment_id}"),
-                        InlineKeyboardButton("💬 Chat", callback_data=f"requestc_{comment_id}")
                     ]
                 ])
                 await query.message.reply_text(body, reply_markup=keyboard, parse_mode="HTML")
@@ -882,9 +890,13 @@ async def button_click(update: Update, context: CallbackContext) -> None:
             return
         try:
             if action == 'like':
-                Comment.like_comment(obj_id)
+                if not Comment.like_comment(obj_id):
+                    await query.answer("❌ Failed to like the comment.", show_alert=True)
+                    return
             else:
-                Comment.dislike_comment(obj_id)
+                if not Comment.dislike_comment(obj_id):
+                    await query.answer("❌ Failed to dislike the comment.", show_alert=True)
+                    return
             # Fetch updated comment and update the message text
             c = Comment.get_comment(obj_id)
             if not c:
@@ -911,131 +923,28 @@ async def button_click(update: Update, context: CallbackContext) -> None:
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("👍 Like", callback_data=f"like_{cid}"),
                  InlineKeyboardButton("👎 Dislike", callback_data=f"dislike_{cid}")],
-                [InlineKeyboardButton("↩️ Reply", callback_data=f"reply_{cid}")],
-                [InlineKeyboardButton("🚩 Report User", callback_data=f"reportc_{cid}"),
-                 InlineKeyboardButton("💬 Request Chat", callback_data=f"requestc_{cid}")]
+                [InlineKeyboardButton("↩️ Reply", callback_data=f"reply_{cid}")]
             ])
             try:
                 await query.edit_message_text(body, reply_markup=keyboard, parse_mode="HTML")
             except Exception as e:
                 logger.warning(f"edit_message_text failed, sending new message instead: {e}")
-                await query.message.reply_text(body, reply_markup=keyboard, parse_mode="HTML")
         except Exception as e:
-            logger.error(f"Error updating reaction: {e}")
-            await query.message.reply_text("❌ Failed to update reaction. Please try again later.")
-        return
+            logger.error(f"Error handling like/dislike action: {e}", exc_info=True)
+            try:
+                await query.answer("❌ An error occurred while processing your vote.", show_alert=True)
+            except Exception:
+                pass
 
-
-    # Handle report comment
-    if query.data and query.data.startswith('reportc_'):
-        logger.info(f"Report callback received: {query.data}")
-        try:
-            # Extract comment ID
-            _, cid = query.data.split('_', 1)
-            logger.info(f"Processing report for comment: {cid}")
-            
-            try:
-                obj_id = ObjectId(cid)
-                logger.debug(f"Converted to ObjectId: {obj_id}")
-            except Exception as e:
-                error_msg = f"Invalid ObjectId format: {cid} - {str(e)}"
-                logger.error(error_msg)
-                await query.answer("❌ Invalid comment reference.", show_alert=True)
-                return
-            
-            try:
-                # Get comment from database
-                c = await db.get_collection('comments').find_one({"_id": obj_id})
-                if not c:
-                    logger.warning(f"Comment not found: {cid}")
-                    await query.answer("❌ Comment not found.", show_alert=True)
-                    return
-                
-                logger.debug(f"Found comment: {c}")
-                
-                # Prepare report data
-                reporter = update.effective_user
-                text = c.get('text', '')
-                owner_id = c.get('user_id')
-                message_id = c.get('message_id', '')
-                
-                logger.debug(f"Prepared report data - reporter: {reporter.id}, owner: {owner_id}, message_id: {message_id}")
-                
-                # Create report message
-                admin_msg = (
-                    "🚩 New Comment Report\n\n"
-                    f"📝 Comment ID: `{cid}`\n"
-                    f"👤 Comment by: `{owner_id}`\n"
-                    f"🚨 Reported by: {reporter.mention_markdown()} (`{reporter.id}`)\n"
-                    f"📅 Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                    "💬 Comment text:\n"
-                    f"```\n{text[:500]}\n```"
-                )
-                
-                # Create action buttons for admin
-                view_url = f"https://t.me/c/{str(CHANNEL_ID).replace('-100', '')}/{message_id}" if message_id else "#"
-                action_buttons = [
-                    [
-                        InlineKeyboardButton("🗑️ Delete Comment", callback_data=f"delete_comment_{cid}"),
-                        InlineKeyboardButton("👁️ View Comment", url=view_url)
-                    ],
-                    [
-                        InlineKeyboardButton("⚠️ Warn User", callback_data=f"warn_user_{owner_id}_{cid}")
-                    ]
-                ]
-                
-                logger.debug(f"Sending report to admin group: {ADMIN_GROUP_ID}")
-                
-                # Send to admin group
-                try:
-                    await context.bot.send_message(
-                        chat_id=ADMIN_GROUP_ID,
-                        text=admin_msg,
-                        reply_markup=InlineKeyboardMarkup(action_buttons),
-                        parse_mode='Markdown',
-                        disable_web_page_preview=True
-                    )
-                    logger.info("Report sent to admin group")
-                except Exception as send_error:
-                    logger.error(f"Failed to send message to admin group: {str(send_error)}")
-                    raise
-                
-                # Log the report
-                try:
-                    await db.get_collection('reports').insert_one({
-                        'comment_id': obj_id,
-                        'reporter_id': reporter.id,
-                        'reporter_username': reporter.username,
-                        'reported_at': datetime.utcnow(),
-                        'status': 'pending'
-                    })
-                    logger.info(f"Report logged in database for comment {cid}")
-                except Exception as db_error:
-                    logger.error(f"Failed to log report in database: {str(db_error)}")
-                    # Continue even if DB logging fails, as the admin was already notified
-                
-                # Notify user
-                await query.answer("✅ Report submitted. Our team will review it shortly.", show_alert=True)
-                logger.info(f"Successfully processed report for comment {cid} by user {reporter.id}")
-                
-            except Exception as e:
-                logger.error(f"Error in report processing: {str(e)}", exc_info=True)
-                await query.answer("❌ Failed to process report. Please try again.", show_alert=True)
-                
-        except Exception as e:
-            logger.error(f"Critical error in report handler: {str(e)}", exc_info=True)
-            try:
-                await query.answer("❌ An error occurred. Please try again later.", show_alert=True)
-            except Exception as final_error:
-                logger.error(f"Failed to send error notification: {str(final_error)}")
-                
-        return
-        
     # Handle admin actions
     if query.data and query.data.startswith('admin_'):
         try:
-            # Check if the command is from an admin
             admin_ids = [int(id_str) for id_str in os.getenv('ADMIN_IDS', '').split(',') if id_str.strip().isdigit()]
+            if not admin_ids:
+                logger.error("No admin IDs configured in environment variables")
+                await query.answer("❌ Server configuration error. Please contact the administrator.", show_alert=True)
+                return
+                
             if query.from_user.id not in admin_ids:
                 await query.answer("❌ You are not authorized to perform this action.", show_alert=True)
                 return
@@ -1054,7 +963,7 @@ async def button_click(update: Update, context: CallbackContext) -> None:
                             {"comment_id": ObjectId(comment_id)},
                             {"$set": {"status": "resolved", "action": "deleted", "resolved_at": datetime.utcnow(), "resolved_by": query.from_user.id}}
                         )
-                        
+
                         # Notify in the admin group
                         await query.message.edit_text(
                             f"✅ Comment {comment_id} has been deleted by @{query.from_user.username}\n\n" + 
@@ -1067,63 +976,45 @@ async def button_click(update: Update, context: CallbackContext) -> None:
                         try:
                             comment = await db.get_collection('comments').find_one({"_id": ObjectId(comment_id)})
                             if comment and 'message_id' in comment:
-                                await context.bot.delete_message(
-                                    chat_id=CHANNEL_ID,
-                                    message_id=comment['message_id']
-                                )
+                                try:
+                                    await context.bot.delete_message(
+                                        chat_id=CHANNEL_ID,
+                                        message_id=comment['message_id']
+                                    )
+                                    await query.answer("Comment deleted successfully.", show_alert=True)
+                                except Exception as e:
+                                    logger.error(f"Failed to delete message from channel: {e}")
+                                    await query.answer("Comment marked as deleted but could not remove from channel.", show_alert=True)
                         except Exception as e:
-                            logger.error(f"Failed to delete message from channel: {e}")
-                            
+                            logger.error(f"Error finding comment: {e}")
+                            await query.answer("Comment marked as deleted but could not verify channel message.", show_alert=True)
                     else:
-                        await query.answer("❌ Comment not found or already deleted.", show_alert=True)
+                        await query.answer("Comment not found or already deleted.", show_alert=True)
+                        
                 except Exception as e:
-                    logger.error(f"Error deleting comment: {e}")
-                    await query.answer("❌ An error occurred while deleting the comment.", show_alert=True)
-                    
+                    logger.error(f"Error in delete action: {e}")
+                    await query.answer("An error occurred while processing the delete request.", show_alert=True)
+
             elif action == 'warn' and len(action_parts) == 5:  # admin_warn_user_<user_id>_<comment_id>
                 user_id = int(action_parts[3])
                 comment_id = action_parts[4]
                 
-                # Update the report status
-                await db.get_collection('reports').update_many(
-                    {"comment_id": ObjectId(comment_id)},
-                    {"$set": {"status": "resolved", "action": "user_warned", "resolved_at": datetime.utcnow(), "resolved_by": query.from_user.id}}
-                )
-                
-                # Notify the user
                 try:
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=f"⚠️ *Warning* ⚠️\n\n"
-                             f"Your comment has been reported and found to be in violation of our community guidelines. "
-                             f"Please review our rules to avoid further actions on your account.",
-                        parse_mode='Markdown'
+                    # Update the report status
+                    result = await db.get_collection('reports').update_many(
+                        {"comment_id": ObjectId(comment_id)},
+                        {"$set": {"status": "resolved", "action": "user_warned", "resolved_at": datetime.utcnow(), "resolved_by": query.from_user.id}}
                     )
+                    
+                    if result.matched_count == 0:
+                        logger.warning(f"No reports found for comment {comment_id}")
+                        await query.answer("⚠️ No active reports found for this comment.", show_alert=True)
+                        return
                 except Exception as e:
-                    logger.warning(f"Could not send warning to user {user_id}: {e}")
-                
-                # Update the admin message
-                await query.message.edit_text(
-                    f"⚠️ User {user_id} has been warned by @{query.from_user.username}\n\n" + 
-                    query.message.text,
-                    parse_mode='Markdown',
-                    reply_markup=InlineKeyboardMarkup([
-                        [
-                            InlineKeyboardButton("🗑️ Delete Comment", callback_data=f"admin_del_comment_{comment_id}"),
-                            InlineKeyboardButton("✅ Ignore Report", callback_data=f"admin_ignore_{comment_id}")
-                        ]
-                    ])
-                )
-                
-            elif action == 'ignore' and len(action_parts) == 3:  # admin_ignore_<comment_id>
-                comment_id = action_parts[2]
-                
-                # Update the report status
-                await db.get_collection('reports').update_many(
-                    {"comment_id": ObjectId(comment_id)},
-                    {"$set": {"status": "ignored", "resolved_at": datetime.utcnow(), "resolved_by": query.from_user.id}}
-                )
-                
+                    logger.error(f"Error updating reports for warn action: {e}", exc_info=True)
+                    await query.answer("❌ Failed to update report status.", show_alert=True)
+                    return
+
                 # Update the admin message
                 await query.message.edit_text(
                     f"✅ Report ignored by @{query.from_user.username}\n\n" + 
@@ -1132,7 +1023,7 @@ async def button_click(update: Update, context: CallbackContext) -> None:
                     reply_markup=InlineKeyboardMarkup([
                         [
                             InlineKeyboardButton("🗑️ Delete Comment", callback_data=f"admin_del_comment_{comment_id}"),
-                            InlineKeyboardButton("⚠️ Warn User", callback_data=f"admin_warn_user_{owner_id}_{comment_id}")
+                            InlineKeyboardButton("⚠️ Warn User", callback_data=f"admin_warn_user_{user_id}_{comment_id}")
                         ]
                     ])
                 )
@@ -1743,12 +1634,15 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "I'm not sure what you're trying to do. Use the buttons or type /help for a list of commands."
     )
 
-def main() -> None:
+async def main() -> tuple:
     """
     Start and run the Telegram bot with enhanced logging and error handling.
     
     This function initializes the bot, sets up all necessary handlers,
     and manages the bot's lifecycle with proper error handling and logging.
+    
+    Returns:
+        tuple: A tuple containing (application, keep_alive) instances for cleanup
     """
     try:
         logger.info("🚀 Initializing bot...")
@@ -1854,24 +1748,101 @@ def main() -> None:
         application.add_error_handler(error_handler)
         
         # ===== Start the Bot =====
-        logger.info("✅ All handlers registered successfully")
-        logger.info("🔄 Starting bot... (Press Ctrl+C to stop)")
+        logger.info("🤖 Starting bot...")
         
-        # Run the bot
-        application.run_polling(
+        # Start the keep-alive server
+        keep_alive = KeepAliveServer(port=int(os.getenv('KEEP_ALIVE_PORT', '8080')))
+        await keep_alive.start()
+        logger.info("🌐 Keep-alive server started")
+        
+        # Initialize the application
+        await application.initialize()
+        await application.start()
+        
+        # Start polling for updates
+        await application.updater.start_polling(
             drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES,
-            close_loop=False
+            allowed_updates=Update.ALL_TYPES
         )
+        
+        # Return the application and keep_alive for cleanup
+        return application, keep_alive
         
     except Exception as e:
         logger.critical(f"❌ Fatal error in main: {e}", exc_info=True)
         raise
+    
+    return None, None  # This line is only reached if there was an error
+
+async def run_bot():
+    """Run the bot with proper async/await handling and retry logic."""
+    application = None
+    keep_alive = None
+    max_retries = 5
+    retry_delay = 5  # seconds
+    
+    try:
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info(f"🚀 Attempt {attempt}/{max_retries} to start the bot...")
+                
+                # Run the main function and get the application and keep_alive instances
+                application, keep_alive = await main()
+                
+                # If we get here, the bot started successfully
+                logger.info("✅ Bot started successfully!")
+                
+                try:
+                    # Keep the bot running
+                    while True:
+                        await asyncio.sleep(3600)  # Sleep for an hour
+                except (KeyboardInterrupt, SystemExit):
+                    logger.info("\n🛑 Received exit signal, shutting down...")
+                    return
+                except Exception as e:
+                    logger.error(f"Error in bot main loop: {e}", exc_info=True)
+                    return
+                
+            except telegram.error.TimedOut:
+                logger.warning(f"⚠️ Connection timed out (attempt {attempt}/{max_retries})")
+                if attempt < max_retries:
+                    logger.info(f"🔄 Retrying in {retry_delay} seconds...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 60)  # Exponential backoff, max 60 seconds
+                else:
+                    logger.error("❌ Max retries reached. Giving up.")
+                    return
+                    
+            except Exception as e:
+                logger.error(f"❌ Unexpected error in run_bot: {e}", exc_info=True)
+                if attempt < max_retries:
+                    logger.info(f"🔄 Retrying in {retry_delay} seconds...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 60)  # Exponential backoff, max 60 seconds
+                else:
+                    logger.error("❌ Max retries reached. Giving up.")
+                    return
+    
     finally:
         # Cleanup and shutdown
         logger.info("🛑 Bot is shutting down...")
-        # Add any cleanup code here if needed
-        # No need to explicitly close the connection as it's handled by the Database class
+        
+        try:
+            # Stop the application if it was started
+            if application:
+                await application.stop()
+                await application.shutdown()
+        except Exception as e:
+            logger.error(f"Error during application shutdown: {e}", exc_info=True)
+        
+        try:
+            # Stop the keep-alive server if it's running
+            if keep_alive:
+                await keep_alive.stop()
+        except Exception as e:
+            logger.error(f"Error during keep-alive server shutdown: {e}", exc_info=True)
+            
+        logger.info("✅ Bot has been shut down")
 
 
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE, query: CallbackQuery = None) -> None:
@@ -2217,4 +2188,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        print("\n👋 Bot stopped by user")
+    except Exception as e:
+        print(f"\n❌ Fatal error: {e}")
+        import traceback
+        traceback.print_exc()

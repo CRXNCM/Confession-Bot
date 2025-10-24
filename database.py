@@ -14,19 +14,54 @@ class Database:
             cls._instance._initialize()
         return cls._instance
     
-    def _initialize(self):
-        """Initialize the MongoDB client and create indexes."""
-        try:
-            self.client = MongoClient(MONGODB_URI)
-            self.db = self.client[DATABASE_NAME]  # Use the configured database name
-            logger.info("✅ Successfully connected to MongoDB!")
-            
-            # Create indexes
-            self._create_indexes()
-            
-        except Exception as e:
-            logger.error(f"❌ Error connecting to MongoDB: {e}")
-            raise
+    def _initialize(self, max_retries: int = 3, retry_delay: int = 2):
+        """Initialize the MongoDB client with retry logic and create indexes.
+        
+        Args:
+            max_retries: Maximum number of connection attempts
+            retry_delay: Delay in seconds between retry attempts
+        """
+        last_exception = None
+        
+        for attempt in range(max_retries):
+            try:
+                # Configure connection with timeouts and retry writes
+                self.client = MongoClient(
+                    MONGODB_URI,
+                    serverSelectionTimeoutMS=30000,  # 30 seconds
+                    connectTimeoutMS=30000,          # 30 seconds
+                    socketTimeoutMS=45000,           # 45 seconds
+                    maxPoolSize=100,                 # Maximum number of connections
+                    retryWrites=True,
+                    retryReads=True,
+                    connect=False  # Lazy connect
+                )
+                
+                # Test the connection
+                self.client.server_info()
+                self.db = self.client[DATABASE_NAME]
+                logger.info("✅ Successfully connected to MongoDB!")
+                
+                # Create indexes
+                self._create_indexes()
+                return  # Success - exit the retry loop
+                
+            except Exception as e:
+                last_exception = e
+                if attempt < max_retries - 1:  # Don't sleep on the last attempt
+                    wait_time = retry_delay * (attempt + 1)
+                    logger.warning(
+                        f"⚠️ Connection attempt {attempt + 1}/{max_retries} failed: {str(e)}. "
+                        f"Retrying in {wait_time} seconds..."
+                    )
+                    import time
+                    time.sleep(wait_time)
+                continue
+        
+        # If we get here, all retries failed
+        error_msg = f"❌ Failed to connect to MongoDB after {max_retries} attempts: {str(last_exception)}"
+        logger.error(error_msg)
+        raise ConnectionError(error_msg) from last_exception
     
     def _create_indexes(self):
         """Create necessary indexes for the database."""
