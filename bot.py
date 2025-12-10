@@ -1431,7 +1431,16 @@ async def main() -> tuple:
         logger.info("✅ Environment variables loaded successfully")
         
         # Create the Application
-        application = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN')).build()
+        # On some environments (e.g., Render) python-telegram-bot's Application may try to
+        # construct an Updater internally, which can fail depending on the installed PTB version.
+        # Explicitly disabling the Updater avoids AttributeError during build.
+        application = (
+            Application
+            .builder()
+            .token(os.getenv('TELEGRAM_BOT_TOKEN'))
+            .updater(None)
+            .build()
+        )
         logger.debug("Application instance created")
         
         # ===== Setup Handlers =====
