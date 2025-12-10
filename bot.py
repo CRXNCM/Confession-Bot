@@ -18,6 +18,9 @@ from telegram.error import TimedOut, NetworkError, RetryAfter, BadRequest, ChatM
 from config import ADMIN_GROUP_ID, CHANNEL_ID
 from keepalive import KeepAliveServer
 from profile_handlers import handle_profile_callback
+import telegram
+print("python-telegram-bot version:", telegram.__version__)
+
 
 # (Profile-related history functions removed)
 
@@ -1406,216 +1409,103 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "I'm not sure what you're trying to do. Use the buttons or type /help for a list of commands."
     )
 
-async def main() -> tuple:
-    """
-    Start and run the Telegram bot with enhanced logging and error handling.
-    
-    This function initializes the bot, sets up all necessary handlers,
-    and manages the bot's lifecycle with proper error handling and logging.
-    
-    Returns:
-        tuple: A tuple containing (application, keep_alive) instances for cleanup
-    """
-    try:
-        logger.info("🚀 Initializing bot...")
-        
-        # Load environment variables
-        load_dotenv()
-        
-        # Validate required environment variables
-        required_vars = ['TELEGRAM_BOT_TOKEN', 'MONGODB_URI', 'ADMIN_IDS', 'CHANNEL_ID']
-        missing_vars = [var for var in required_vars if not os.getenv(var)]
-        if missing_vars:
-            raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
-        
-        logger.info("✅ Environment variables loaded successfully")
-        
-        # Create the Application
-        application = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN')).build()
-        logger.debug("Application instance created")
-        
-        # ===== Setup Handlers =====
-        
-        # 1. Command Handlers (must be added before the conversation handler)
-        command_handlers = [
-            ("start", start),
-            ("help", help_command)
-        ]
-        
-        for cmd, handler in command_handlers:
-            application.add_handler(CommandHandler(cmd, handler))
-        
-        # 2. Profile-related callbacks (buttons only for now) — add BEFORE conversation handler for priority
-        application.add_handler(CallbackQueryHandler(
-            handle_profile_callback,
-            pattern=r'^(edit_profile|back_to_profile|change_profile_emoji|change_nickname|change_bio|edit_visibility|my_confessions|my_comments|profile_settings)$',
-            block=False
-        ), group=0)
-            
-        # 3. Conversation Handler for confessions (must be added after command handlers)
-        conv_handler = ConversationHandler(
-            entry_points=[CommandHandler('confess', start)],
-            states={
-                TEXT: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input)
-                ],
-                CATEGORY: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input),
-                    CallbackQueryHandler(button_click, pattern=r'^category_\d+$')
-                ],
-                'PREVIEW': [
-                    CallbackQueryHandler(button_click, pattern='^preview_')  # Will be handled by button_click
-                ]
-            },
-            fallbacks=[
-                CommandHandler('cancel', cancel_confession),
-                MessageHandler(filters.ALL & ~filters.COMMAND, handle_text_input)  # Fallback to text input
+def configure_application() -> Application:
+    """Configure and return a fully built Application with all handlers."""
+    # Create the Application
+    application = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN')).build()
+
+    # 1. Command Handlers (must be added before the conversation handler)
+    command_handlers = [
+        ("start", start),
+        ("help", help_command)
+    ]
+    for cmd, handler in command_handlers:
+        application.add_handler(CommandHandler(cmd, handler))
+
+    # 2. Profile-related callbacks (buttons only for now) — add BEFORE conversation handler for priority
+    application.add_handler(CallbackQueryHandler(
+        handle_profile_callback,
+        pattern=r'^(edit_profile|back_to_profile|change_profile_emoji|change_nickname|change_bio|edit_visibility|my_confessions|my_comments|profile_settings)$',
+        block=False
+    ), group=0)
+
+    # 3. Conversation Handler for confessions (must be added after command handlers)
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('confess', start)],
+        states={
+            TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input)
             ],
-            allow_reentry=True,
-            per_message=False  # Changed to False to avoid potential issues
-        )
-        application.add_handler(conv_handler)
-        
-        # 4. Add preview callbacks with higher priority
-        application.add_handler(CallbackQueryHandler(
-            button_click, 
-            pattern='^preview_',
-            block=False
-        ), group=0)
-        
-        # Command handlers are now added before the conversation handler
-        
-        # 5. Message Handlers
-        # Log all incoming messages (lowest priority group)
-        application.add_handler(MessageHandler(filters.ALL, log_incoming), group=-1)
-        
-        # Handle text messages (medium priority)
-        application.add_handler(MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_text_input
-        ))
-        
-        # 6. Callback Query Handlers
-        # Log all callbacks (lowest priority group)
-        application.add_handler(CallbackQueryHandler(log_callback, pattern=r'.*'), group=-1)
-        
-        # Comment-related and rules acceptance callbacks
-        application.add_handler(CallbackQueryHandler(
-            button_click, 
-            pattern=r'^(showcomments|addcomment|like|dislike|reply)_|^accept_rules$'
-        ))
-        
-        # Import button_callback from confession module
-        from confession import button_callback
+            CATEGORY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input),
+                CallbackQueryHandler(button_click, pattern=r'^category_\d+$')
+            ],
+            'PREVIEW': [
+                CallbackQueryHandler(button_click, pattern='^preview_')
+            ]
+        },
+        fallbacks=[
+            CommandHandler('cancel', cancel_confession),
+            MessageHandler(filters.ALL & ~filters.COMMAND, handle_text_input)
+        ],
+        allow_reentry=True,
+        per_message=False
+    )
+    application.add_handler(conv_handler)
 
-        # Confession approval/rejection callbacks (admin only)
-        application.add_handler(CallbackQueryHandler(
-            button_callback, 
-            pattern=r'^(approve|reject)_'
-        ))
-        
-        # Add error handler
-        application.add_error_handler(error_handler)
-        
-        # ===== Start the Bot =====
-        logger.info("🤖 Starting bot...")
-        
-        # Start the keep-alive server only if a port is provided
-        # On Render Background Workers, there is no port and this should be skipped.
-        keep_alive = None
-        port_str = os.getenv('PORT') or os.getenv('KEEP_ALIVE_PORT')
-        if port_str:
-            try:
-                keep_alive = KeepAliveServer(port=int(port_str))
-                await keep_alive.start()
-                logger.info("🌐 Keep-alive server started")
-            except Exception as e:
-                logger.warning(f"Keep-alive server failed to start: {e}")
-        
-        # Run polling (handles initialize/start/shutdown internally)
-        await application.run_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES
-        )
-        
-        # Return the application and keep_alive for cleanup
-        return application, keep_alive
-        
-    except Exception as e:
-        logger.critical(f"❌ Fatal error in main: {e}", exc_info=True)
-        raise
-    
-    return None, None  # This line is only reached if there was an error
+    # 4. Add preview callbacks with higher priority
+    application.add_handler(CallbackQueryHandler(
+        button_click,
+        pattern='^preview_',
+        block=False
+    ), group=0)
 
-async def run_bot():
-    """Run the bot with proper async/await handling and retry logic."""
-    application = None
-    keep_alive = None
-    max_retries = 5
-    retry_delay = 5  # seconds
-    
-    try:
-        for attempt in range(1, max_retries + 1):
-            try:
-                logger.info(f"🚀 Attempt {attempt}/{max_retries} to start the bot...")
-                
-                # Run the main function and get the application and keep_alive instances
-                application, keep_alive = await main()
-                
-                # If we get here, the bot started successfully
-                logger.info("✅ Bot started successfully!")
-                
-                try:
-                    # Keep the bot running
-                    while True:
-                        await asyncio.sleep(3600)  # Sleep for an hour
-                except (KeyboardInterrupt, SystemExit):
-                    logger.info("\n🛑 Received exit signal, shutting down...")
-                    return
-                except Exception as e:
-                    logger.error(f"Error in bot main loop: {e}", exc_info=True)
-                    return
-                
-            except telegram.error.TimedOut:
-                logger.warning(f"⚠️ Connection timed out (attempt {attempt}/{max_retries})")
-                if attempt < max_retries:
-                    logger.info(f"🔄 Retrying in {retry_delay} seconds...")
-                    await asyncio.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 2, 60)  # Exponential backoff, max 60 seconds
-                else:
-                    logger.error("❌ Max retries reached. Giving up.")
-                    return
-                    
-            except Exception as e:
-                logger.error(f"❌ Unexpected error in run_bot: {e}", exc_info=True)
-                if attempt < max_retries:
-                    logger.info(f"🔄 Retrying in {retry_delay} seconds...")
-                    await asyncio.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 2, 60)  # Exponential backoff, max 60 seconds
-                else:
-                    logger.error("❌ Max retries reached. Giving up.")
-                    return
-    
-    finally:
-        # Cleanup and shutdown
-        logger.info("🛑 Bot is shutting down...")
-        
-        try:
-            # Stop the application if it was started
-            if application:
-                await application.stop()
-                await application.shutdown()
-        except Exception as e:
-            logger.error(f"Error during application shutdown: {e}", exc_info=True)
-        
-        try:
-            # Stop the keep-alive server if it's running
-            if keep_alive:
-                await keep_alive.stop()
-        except Exception as e:
-            logger.error(f"Error during keep-alive server shutdown: {e}", exc_info=True)
-            
-        logger.info("✅ Bot has been shut down")
+    # 5. Message Handlers
+    application.add_handler(MessageHandler(filters.ALL, log_incoming), group=-1)
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        handle_text_input
+    ))
+
+    # 6. Callback Query Handlers
+    application.add_handler(CallbackQueryHandler(log_callback, pattern=r'.*'), group=-1)
+    application.add_handler(CallbackQueryHandler(
+        button_click,
+        pattern=r'^(showcomments|addcomment|like|dislike|reply)_|^accept_rules$'
+    ))
+
+    # Import button_callback from confession module
+    from confession import button_callback
+    application.add_handler(CallbackQueryHandler(
+        button_callback,
+        pattern=r'^(approve|reject)_'
+    ))
+
+    # Error handler
+    application.add_error_handler(error_handler)
+
+    return application
+
+
+def main() -> None:
+    """Entry point: validate env, build app, and run polling (no asyncio.run)."""
+    logger.info("🚀 Initializing bot...")
+    load_dotenv()
+
+    required_vars = ['TELEGRAM_BOT_TOKEN', 'MONGODB_URI', 'ADMIN_IDS', 'CHANNEL_ID']
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
+    if missing_vars:
+        raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+    logger.info("✅ Environment variables loaded successfully")
+
+    application = configure_application()
+
+    logger.info("🤖 Starting bot...")
+    # Note: We intentionally skip keep-alive server here; Render Worker doesn't need it.
+    application.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES
+    )
 
 
 async def _deprecated_show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE, query: CallbackQuery = None) -> None:
@@ -1756,7 +1646,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 if __name__ == "__main__":
     try:
-        asyncio.run(run_bot())
+        main()
     except KeyboardInterrupt:
         print("\n👋 Bot stopped by user")
     except Exception as e:

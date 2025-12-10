@@ -1,5 +1,5 @@
-# Telegram Bot
-python-telegram-bot==21.7
+# Telegram Bot (match local dev version)
+python-telegram-bot==22.5
 
 # MongoDB Driver (sync version)
 pymongo[srv]==4.9.1
