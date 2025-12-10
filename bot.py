@@ -1431,16 +1431,7 @@ async def main() -> tuple:
         logger.info("✅ Environment variables loaded successfully")
         
         # Create the Application
-        # On some environments (e.g., Render) python-telegram-bot's Application may try to
-        # construct an Updater internally, which can fail depending on the installed PTB version.
-        # Explicitly disabling the Updater avoids AttributeError during build.
-        application = (
-            Application
-            .builder()
-            .token(os.getenv('TELEGRAM_BOT_TOKEN'))
-            .updater(None)
-            .build()
-        )
+        application = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN')).build()
         logger.debug("Application instance created")
         
         # ===== Setup Handlers =====
@@ -1529,17 +1520,20 @@ async def main() -> tuple:
         # ===== Start the Bot =====
         logger.info("🤖 Starting bot...")
         
-        # Start the keep-alive server
-        keep_alive = KeepAliveServer(port=int(os.getenv('KEEP_ALIVE_PORT', '8080')))
-        await keep_alive.start()
-        logger.info("🌐 Keep-alive server started")
+        # Start the keep-alive server only if a port is provided
+        # On Render Background Workers, there is no port and this should be skipped.
+        keep_alive = None
+        port_str = os.getenv('PORT') or os.getenv('KEEP_ALIVE_PORT')
+        if port_str:
+            try:
+                keep_alive = KeepAliveServer(port=int(port_str))
+                await keep_alive.start()
+                logger.info("🌐 Keep-alive server started")
+            except Exception as e:
+                logger.warning(f"Keep-alive server failed to start: {e}")
         
-        # Initialize the application
-        await application.initialize()
-        await application.start()
-        
-        # Start polling for updates
-        await application.updater.start_polling(
+        # Run polling (handles initialize/start/shutdown internally)
+        await application.run_polling(
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES
         )

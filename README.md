@@ -142,6 +142,35 @@ For production deployment, consider using:
 - Redis for session management (optional)
 - Monitoring and logging
 
+### Deploy to Render (Recommended)
+
+This bot uses long polling and does not require a public HTTP endpoint. On Render, deploy it as a Background Worker.
+
+1. Fork or push this repo to your Git provider (GitHub/GitLab).
+2. Ensure the following files exist in the repo root:
+   - `render.yaml` (service definition)
+   - `.env.example` (template of required environment variables)
+3. Create a new Render account and click New → Blueprint. Point it at your repo.
+4. Render will detect `render.yaml` and propose creating a Worker service.
+5. Set the environment variables for the service (copy from `.env.example`):
+   - `TELEGRAM_BOT_TOKEN`
+   - `MONGODB_URI`
+   - `ADMIN_IDS`
+   - `CHANNEL_ID`
+   - `ADMIN_GROUP_ID`
+   - (Optional) `KEEP_ALIVE_PORT` — not required for Workers.
+6. Click Apply to create resources, then Deploy.
+
+Notes:
+- The worker runs `python bot.py` using long polling.
+- No public port is required. The internal keep-alive server only starts if `PORT` or `KEEP_ALIVE_PORT` is set.
+- Use MongoDB Atlas or any managed MongoDB for `MONGODB_URI`.
+
+Troubleshooting on Render:
+- Check the Logs tab to see startup logs from `bot.py`.
+- Verify your `TELEGRAM_BOT_TOKEN` and Mongo connection string are correct.
+- Ensure `ADMIN_IDS`, `CHANNEL_ID`, and `ADMIN_GROUP_ID` are numeric and valid.
+
 ## Contributing
 
 1. Fork the repository

@@ -1,0 +1,26 @@
+services:
+  - type: worker
+    name: confession-bot
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python bot.py"
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: CHANNEL_ID
+        sync: false
+      - key: ADMIN_GROUP_ID
+        sync: false
+      # Optional: only needed if you deploy as a Web Service or want an HTTP health endpoint
+      - key: KEEP_ALIVE_PORT
+        value: "${PORT}"
+        optional: true
+      # Optional: pin Python version
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+        optional: true
