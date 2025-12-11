@@ -56,22 +56,32 @@ async def health_check(request: web.Request) -> web.Response:
 
 async def webhook_handler(request: web.Request) -> web.Response:
     if request.method != 'POST':
-        return web.Response(status=405)
+        logger.warning(f"Received non-POST request: {request.method}")
+        return web.Response(status=405, text="Method Not Allowed")
 
     # Verify token in URL path
     token = request.match_info.get('token')
     if token != BOT_TOKEN:
-        logger.warning(f"Invalid token received: {get_masked_token(token)}")
+        masked_token = get_masked_token(token)
+        logger.warning(f"Invalid token received: {masked_token}")
         return web.Response(status=403, text="Invalid token")
 
     try:
         json_data = await request.json()
-        update = Update.de_json(json_data, request.app['bot'].bot)
+        logger.debug(f"Received update: {json_data}")
+        
+        # Process the update
+        update = Update.de_json(json_data, request.app['application'].bot)
         await request.app['application'].update_queue.put(update)
-        return web.Response()
+        
+        return web.Response(text="OK")
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse JSON: {e}")
+        return web.Response(status=400, text="Invalid JSON")
     except Exception as e:
-        logger.error(f"Error processing update: {e}")
-        return web.Response(status=500)
+        logger.error(f"Error processing update: {e}", exc_info=True)
+        return web.Response(status=500, text="Internal Server Error")
 
 # Command handlers (moved from original file)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -115,10 +125,25 @@ async def on_startup(application: Application) -> None:
     """Initialize bot and set webhook on startup."""
     await application.initialize()
     await application.start()
-    await application.bot.set_webhook(
-        url=f"{os.getenv('RENDER_SERVICE_URL', '')}/webhook/{BOT_TOKEN}"
-    )
-    logger.info("Bot started and webhook set")
+    
+    # Get the webhook URL from environment or use the Render service URL
+    webhook_url = os.getenv('WEBHOOK_URL')
+    if not webhook_url:
+        render_service = os.getenv('RENDER_SERVICE_URL', '').rstrip('/')
+        if not render_service:
+            logger.error("Neither WEBHOOK_URL nor RENDER_SERVICE_URL is set in environment variables")
+            return
+        webhook_url = f"{render_service}/webhook/{BOT_TOKEN}"
+    
+    # Set the webhook
+    try:
+        await application.bot.delete_webhook()  # Clean up any existing webhook
+        result = await application.bot.set_webhook(url=webhook_url)
+        logger.info(f"Webhook set successfully: {webhook_url}")
+        logger.info(f"Bot info: {await application.bot.get_me()}")
+    except Exception as e:
+        logger.error(f"Failed to set webhook: {e}")
+        raise
 
 async def on_shutdown(application: Application) -> None:
     """Cleanup on shutdown."""
@@ -147,30 +172,44 @@ async def error_handler(update: object, context: CallbackContext) -> None:
 
 def main() -> None:
     """Run the bot."""
-    # Initialize application
-    application = create_application()
+    logger.info("Starting bot initialization...")
     
-    # Create aiohttp web application
-    app = web.Application()
-    app['bot'] = application.bot
-    app['application'] = application
-    
-    # Add routes
-    app.router.add_get("/", health_check)
-    app.router.add_post("/webhook/{token}", webhook_handler)
-    
-    # Set up signal handlers
-    loop = asyncio.get_event_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown(app, application)))
-    
-    # Start the web server
-    web.run_app(
-        app,
-        host='0.0.0.0',
-        port=int(os.getenv('PORT', '5000')),
-        handle_signals=False
-    )
+    try:
+        # Initialize application
+        application = create_application()
+        
+        # Create aiohttp web application
+        app = web.Application()
+        app['bot'] = application.bot
+        app['application'] = application
+        
+        # Add routes
+        app.router.add_get("/", health_check)
+        app.router.add_post("/webhook/{token}", webhook_handler)
+        
+        # Set up signal handlers
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown(app, application)))
+        
+        # Run startup tasks
+        asyncio.create_task(on_startup(application))
+        
+        # Get port from environment variable or use default
+        port = int(os.getenv('PORT', '5000'))
+        logger.info(f"Starting web server on port {port}")
+        
+        # Start the web server
+        web.run_app(
+            app,
+            host='0.0.0.0',
+            port=port,
+            handle_signals=False
+        )
+        
+    except Exception as e:
+        logger.error(f"Failed to start bot: {e}")
+        raise
 
 async def shutdown(app: web.Application, application: Application) -> None:
     """Shutdown the server."""
