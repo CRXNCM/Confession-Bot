@@ -122,28 +122,10 @@ async def setup_application_commands(application: Application) -> None:
     await application.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
 
 async def on_startup(application: Application) -> None:
-    """Initialize bot and set webhook on startup."""
+    """Initialize bot on startup."""
     await application.initialize()
     await application.start()
-    
-    # Get the webhook URL from environment or use the Render service URL
-    webhook_url = os.getenv('WEBHOOK_URL')
-    if not webhook_url:
-        render_service = os.getenv('RENDER_SERVICE_URL', '').rstrip('/')
-        if not render_service:
-            logger.error("Neither WEBHOOK_URL nor RENDER_SERVICE_URL is set in environment variables")
-            return
-        webhook_url = f"{render_service}/webhook/{BOT_TOKEN}"
-    
-    # Set the webhook
-    try:
-        await application.bot.delete_webhook()  # Clean up any existing webhook
-        result = await application.bot.set_webhook(url=webhook_url)
-        logger.info(f"Webhook set successfully: {webhook_url}")
-        logger.info(f"Bot info: {await application.bot.get_me()}")
-    except Exception as e:
-        logger.error(f"Failed to set webhook: {e}")
-        raise
+    logger.info("Bot initialized and started")
 
 async def on_shutdown(application: Application) -> None:
     """Cleanup on shutdown."""
@@ -170,30 +152,53 @@ async def error_handler(update: object, context: CallbackContext) -> None:
         except Exception as e:
             logger.error(f"Error sending error message: {e}")
 
+async def setup_webhook(application: Application) -> None:
+    """Set up the webhook and return the webhook URL."""
+    webhook_url = os.getenv('WEBHOOK_URL')
+    if not webhook_url:
+        render_service = os.getenv('RENDER_SERVICE_URL', '').rstrip('/')
+        if not render_service:
+            raise ValueError("Neither WEBHOOK_URL nor RENDER_SERVICE_URL is set in environment variables")
+        webhook_url = f"{render_service}/webhook/{BOT_TOKEN}"
+    
+    try:
+        await application.bot.delete_webhook()
+        await application.bot.set_webhook(webhook_url)
+        logger.info(f"Webhook set successfully: {webhook_url}")
+        bot_info = await application.bot.get_me()
+        logger.info(f"Bot info: {bot_info}")
+        return webhook_url
+    except Exception as e:
+        logger.error(f"Failed to set webhook: {e}")
+        raise
+
+async def create_app() -> web.Application:
+    """Create and configure the aiohttp application."""
+    # Initialize application
+    application = create_application()
+    
+    # Create aiohttp web application
+    app = web.Application()
+    app['bot'] = application.bot
+    app['application'] = application
+    
+    # Add routes
+    app.router.add_get("/", health_check)
+    app.router.add_post("/webhook/{token}", webhook_handler)
+    
+    # Set up startup and shutdown handlers
+    app.on_startup.append(lambda app: setup_webhook(application))
+    app.on_shutdown.append(lambda app: on_shutdown(application))
+    
+    return app
+
 def main() -> None:
     """Run the bot."""
     logger.info("Starting bot initialization...")
     
     try:
-        # Initialize application
-        application = create_application()
-        
-        # Create aiohttp web application
-        app = web.Application()
-        app['bot'] = application.bot
-        app['application'] = application
-        
-        # Add routes
-        app.router.add_get("/", health_check)
-        app.router.add_post("/webhook/{token}", webhook_handler)
-        
-        # Set up signal handlers
-        loop = asyncio.get_event_loop()
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown(app, application)))
-        
-        # Run startup tasks
-        asyncio.create_task(on_startup(application))
+        # Create and run the application
+        app = asyncio.run(create_app())
         
         # Get port from environment variable or use default
         port = int(os.getenv('PORT', '5000'))
@@ -204,11 +209,11 @@ def main() -> None:
             app,
             host='0.0.0.0',
             port=port,
-            handle_signals=False
+            handle_signals=True
         )
         
     except Exception as e:
-        logger.error(f"Failed to start bot: {e}")
+        logger.error(f"Failed to start bot: {e}", exc_info=True)
         raise
 
 async def shutdown(app: web.Application, application: Application) -> None:
@@ -221,7 +226,11 @@ async def shutdown(app: web.Application, application: Application) -> None:
 
 if __name__ == "__main__":
     logger.info(f"Starting bot with token: {get_masked_token(BOT_TOKEN)}")
-    main()
+    try:
+        main()
+    except Exception as e:
+        logger.critical(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)
 
 # (Profile-related history functions removed)
 
