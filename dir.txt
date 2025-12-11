@@ -1,0 +1,42 @@
+# Confession-Bot Directory Structure and File Descriptions
+
+## Core Application Files
+- `bot.py` - The main bot file containing the Discord bot implementation and command handlers.
+- `confession.py` - Contains the core confession functionality and related classes.
+- `database.py` - Handles all database operations and connections.
+- `models.py` - Defines the data models and database schema using SQLAlchemy ORM.
+- `config.py` - Configuration settings and constants used throughout the application.
+- `profile_handlers.py` - Manages user profile-related functionality and commands.
+
+## Database and Migrations
+- `schema.sql` - SQL schema for database initialization.
+- `migrations/` - Database migration scripts:
+  - `add_category_to_confessions.py` - Migration to add category support to confessions.
+  - `create_report_indexes.py` - Creates indexes for the reporting system.
+  - `update_confessions_for_multiple_categories.py` - Updates confessions to support multiple categories.
+
+## Configuration and Environment
+- `.env` - Environment variables (not version controlled, contains sensitive data).
+- `.env.example` - Example environment variables file (template for .env).
+- `render.yaml` - Configuration for Render deployment.
+- `requirements.txt` - Python package dependencies.
+
+## Utility and Maintenance
+- `keepalive.py` - Keeps the bot alive (useful for 24/7 hosting).
+- `migrate_profile_fields.py` - Script for migrating profile fields in the database.
+- `test_db_connection.py` - Utility to test database connectivity.
+
+## Project Documentation
+- `README.md` - Project documentation, setup instructions, and usage guide.
+- `plan.txt` - Development plan and TODO items.
+
+## Directories
+- `logs/` - Directory for storing application logs.
+- `__pycache__/` - Python bytecode cache (automatically generated).
+- `.git/` - Git version control directory.
+- `query` - Contains database query utilities or scripts.
+
+## Version Control
+- `.gitignore` - Specifies intentionally untracked files to ignore.
+
+This structure follows a well-organized pattern with clear separation of concerns between different components of the application.

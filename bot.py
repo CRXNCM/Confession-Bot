@@ -1,27 +1,183 @@
-import os
-import logging
-import sys
-import time
-import uuid
-import sys
 import asyncio
-import telegram
-from datetime import datetime, timedelta
+import logging
+import signal
+import os
+import sys
 from pathlib import Path
-from logging.handlers import RotatingFileHandler
-from dotenv import load_dotenv
-from bson import ObjectId
+from typing import Optional
+
+import aiohttp.web
+from aiohttp import web
+from telegram import Update, BotCommand, BotCommandScopeAllPrivateChats
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+    CallbackContext,
+)
+from telegram.error import TelegramError
+
+from config import BOT_TOKEN, ADMIN_GROUP_ID, CHANNEL_ID
 from database import db
 from models import Comment, User
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import ContextTypes, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ConversationHandler, Application
-from telegram.error import TimedOut, NetworkError, RetryAfter, BadRequest, ChatMigrated, Conflict, InvalidToken, TelegramError
-from config import ADMIN_GROUP_ID, CHANNEL_ID
-from keepalive import KeepAliveServer
 from profile_handlers import handle_profile_callback
-import telegram
-print("python-telegram-bot version:", telegram.__version__)
 
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(),
+        logging.handlers.RotatingFileHandler(
+            'logs/bot.log',
+            maxBytes=5*1024*1024,  # 5MB
+            backupCount=5
+        )
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Mask token for logging
+def get_masked_token(token: str) -> str:
+    return f"{token[:5]}...{token[-3:]}" if token else "[no token]"
+
+# Webhook route handlers
+async def health_check(request: web.Request) -> web.Response:
+    return web.Response(text="Bot running")
+
+async def webhook_handler(request: web.Request) -> web.Response:
+    if request.method != 'POST':
+        return web.Response(status=405)
+
+    # Verify token in URL path
+    token = request.match_info.get('token')
+    if token != BOT_TOKEN:
+        logger.warning(f"Invalid token received: {get_masked_token(token)}")
+        return web.Response(status=403, text="Invalid token")
+
+    try:
+        json_data = await request.json()
+        update = Update.de_json(json_data, request.app['bot'].bot)
+        await request.app['application'].update_queue.put(update)
+        return web.Response()
+    except Exception as e:
+        logger.error(f"Error processing update: {e}")
+        return web.Response(status=500)
+
+# Command handlers (moved from original file)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Welcome to the bot! Use /help for commands.")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = """
+Available commands:
+/start - Start the bot
+/help - Show this help message
+    """
+    await update.message.reply_text(help_text)
+
+# Application setup
+def create_application() -> Application:
+    """Create and configure the Application instance."""
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    
+    # Add error handler
+    application.add_error_handler(error_handler)
+    
+    return application
+
+async def setup_application_commands(application: Application) -> None:
+    """Set up bot commands."""
+    commands = [
+        BotCommand("start", "Start the bot"),
+        BotCommand("help", "Show help information"),
+    ]
+    await application.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
+
+async def on_startup(application: Application) -> None:
+    """Initialize bot and set webhook on startup."""
+    await application.initialize()
+    await application.start()
+    await application.bot.set_webhook(
+        url=f"{os.getenv('RENDER_SERVICE_URL', '')}/webhook/{BOT_TOKEN}"
+    )
+    logger.info("Bot started and webhook set")
+
+async def on_shutdown(application: Application) -> None:
+    """Cleanup on shutdown."""
+    logger.info("Shutting down...")
+    try:
+        await application.bot.delete_webhook()
+        logger.info("Webhook removed")
+    except Exception as e:
+        logger.error(f"Error removing webhook: {e}")
+    
+    await application.stop()
+    await application.shutdown()
+    logger.info("Shutdown complete")
+
+# Error handler
+async def error_handler(update: object, context: CallbackContext) -> None:
+    """Log errors caused by updates."""
+    logger.error("Exception while handling an update:", exc_info=context.error)
+    if update and hasattr(update, 'effective_message'):
+        try:
+            await update.effective_message.reply_text(
+                "An error occurred while processing your request. Please try again later."
+            )
+        except Exception as e:
+            logger.error(f"Error sending error message: {e}")
+
+def main() -> None:
+    """Run the bot."""
+    # Initialize application
+    application = create_application()
+    
+    # Create aiohttp web application
+    app = web.Application()
+    app['bot'] = application.bot
+    app['application'] = application
+    
+    # Add routes
+    app.router.add_get("/", health_check)
+    app.router.add_post("/webhook/{token}", webhook_handler)
+    
+    # Set up signal handlers
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown(app, application)))
+    
+    # Start the web server
+    web.run_app(
+        app,
+        host='0.0.0.0',
+        port=int(os.getenv('PORT', '5000')),
+        handle_signals=False
+    )
+
+async def shutdown(app: web.Application, application: Application) -> None:
+    """Shutdown the server."""
+    logger.info("Shutdown signal received")
+    await on_shutdown(application)
+    await app.shutdown()
+    await app.cleanup()
+    logger.info("Server stopped")
+
+if __name__ == "__main__":
+    logger.info(f"Starting bot with token: {get_masked_token(BOT_TOKEN)}")
+    main()
 
 # (Profile-related history functions removed)
 
