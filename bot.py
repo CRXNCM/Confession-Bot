@@ -27,6 +27,10 @@ from database import db
 from models import Comment, User
 from profile_handlers import handle_profile_callback
 
+# Ensure logs directory exists
+log_dir = Path('logs')
+log_dir.mkdir(exist_ok=True, parents=True)
+
 # Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -34,7 +38,7 @@ logging.basicConfig(
     handlers=[
         logging.StreamHandler(),
         logging.handlers.RotatingFileHandler(
-            'logs/bot.log',
+            str(log_dir / 'bot.log'),
             maxBytes=5*1024*1024,  # 5MB
             backupCount=5
         )
@@ -181,10 +185,6 @@ if __name__ == "__main__":
     main()
 
 # (Profile-related history functions removed)
-
-# Create logs directory if it doesn't exist
-log_dir = Path('logs')
-log_dir.mkdir(exist_ok=True)
 
 class CustomFormatter(logging.Formatter):
     """Custom formatter with colors and cleaner output"""
