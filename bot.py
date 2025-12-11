@@ -1,5 +1,6 @@
 import os
 import logging
+import sys
 import time
 import uuid
 import sys
@@ -1501,11 +1502,24 @@ def main() -> None:
     application = configure_application()
 
     logger.info("🤖 Starting bot...")
-    # Note: We intentionally skip keep-alive server here; Render Worker doesn't need it.
-    application.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES
-    )
+    try:
+        # Clean up any existing webhook before starting polling
+        logger.info("🔄 Ensuring no webhook is set...")
+        application.bot.delete_webhook(drop_pending_updates=True)
+        
+        logger.info("🔄 Starting polling for updates...")
+        application.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
+        )
+    except telegram.error.Conflict as e:
+        logger.critical("❌ Another instance of this bot is already running. Only one instance can run at a time.")
+        logger.critical("Please check for other running instances on this server or in other environments.")
+        logger.critical(f"Error details: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logger.critical(f"❌ Failed to start bot: {e}", exc_info=True)
+        sys.exit(1)
 
 
 async def _deprecated_show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE, query: CallbackQuery = None) -> None:
